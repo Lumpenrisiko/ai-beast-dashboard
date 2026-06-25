@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Beast Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0e17;--card:#111827;--card-h:#1a2332;--border:#1e2a3a;
+  --t:#e2e8f0;--m:#94a3b8;--mm:#64748b;
+  --blue:#3b82f6;--green:#22c55e;--yellow:#eab308;--red:#ef4444;
+  --purple:#a855f7;--cyan:#06b6d4;--orange:#f97316;
+}
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:var(--bg);color:var(--t);height:100vh;overflow:hidden;
+  display:flex;flex-direction:column;
+}
+
+/* Header */
+.hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 24px;flex-shrink:0;
+  background:linear-gradient(135deg,#111827,#1a1a2e);
+  border-bottom:1px solid var(--border);
+}
+.hdr h1{
+  font-size:1.1rem;font-weight:700;
+  background:linear-gradient(135deg,var(--blue),var(--cyan));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+.badge{
+  font-size:.7rem;padding:2px 10px;border-radius:20px;font-weight:600;
+  background:rgba(34,197,94,.15);color:var(--green);border:1px solid rgba(34,197,94,.3);
+}
+.badge.off{background:rgba(239,68,68,.15);color:var(--red);border-color:rgba(239,68,68,.3)}
+.ht{font-size:.8rem;color:var(--mm);font-variant-numeric:tabular-nums}
+
+/* Main: 4 rows */
+.main{
+  flex:1;display:flex;flex-direction:column;gap:6px;
+  padding:6px 14px 8px;min-height:0;
+}
+
+/* Row 1: GPU Cards */
+.r-gpu{
+  flex:0 0 auto;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;
+}
+
+/* Row 2: Charts - kompakter */
+.r-charts{
+  flex:0 0 140px;display:grid;grid-template-columns:1fr 1fr;gap:8px;
+  min-height:0;overflow:hidden;
+}
+
+/* Row 3: System - kompakter */
+.r-bot{
+  flex:0 0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:8px;
+}
+
+/* Row 4: LM Studio - mehr Platz */
+.r-lm{
+  flex:1;min-height:0;overflow:hidden;
+}
+
+/* ─── GPU Card ────────────────────────────────── */
+.gpu{
+  background:var(--card);border:1px solid var(--border);border-radius:10px;
+  display:flex;flex-direction:column;overflow:hidden;
+  transition:border-color .2s,transform .2s;
+}
+.gpu:hover{border-color:#2d3a4a;transform:translateY(-1px)}
+.gpu-hd{
+  display:flex;align-items:center;gap:8px;padding:7px 12px 5px;
+  border-bottom:1px solid var(--border);
+}
+.gpu-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.gpu-nm{font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gpu-bd{flex:1;padding:5px 12px 7px;display:flex;flex-direction:column;gap:2px}
+.gm{
+  display:grid;grid-template-columns:52px 1fr 68px;align-items:center;gap:5px;
+}
+.gm-l{font-size:.72rem;color:var(--m)}
+.gm-b{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.gm-f{height:100%;border-radius:2px;transition:width .5s ease}
+.gm-v{font-size:.78rem;font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+
+/* ─── Chart ───────────────────────────────────── */
+.ch{
+  background:var(--card);border:1px solid var(--border);border-radius:10px;
+  padding:7px 10px;position:relative;overflow:hidden;min-height:0;
+  display:flex;flex-direction:column;
+}
+.ch canvas{width:100%!important;height:100%!important;flex:1;min-height:0}
+
+/* ─── System Cards - kompakter ────────────────────── */
+.bc{
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:7px 12px;display:flex;align-items:center;gap:8px;
+}
+.bc:hover{background:var(--card-h)}
+.bi{
+  width:28px;height:28px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;font-size:.85rem;flex-shrink:0;
+}
+.bi.c{background:rgba(59,130,246,.15)}
+.bi.r{background:rgba(168,85,247,.15)}
+.bi.d{background:rgba(6,182,212,.15)}
+.bi.l{background:rgba(249,115,22,.15)}
+.bl{font-size:.6rem;color:var(--mm);text-transform:uppercase;letter-spacing:.05em}
+.bv{font-size:.9rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.bs{font-size:.6rem;color:var(--mm)}
+.bbar{width:100%;height:2px;background:rgba(255,255,255,.06);border-radius:1px;overflow:hidden;margin-top:2px}
+.bbf{height:100%;border-radius:1px;transition:width .5s}
+
+/* LM Studio card - größer, mehr Platz */
+.bc-lm{flex-direction:column;align-items:stretch;gap:8px;justify-content:flex-start;padding:12px 18px;flex:1;min-height:0;overflow:hidden}
+.lm-top{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.lm-title{font-size:1rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.lm-st{font-size:.7rem;padding:3px 10px;border-radius:12px;font-weight:600}
+.lm-st.on{background:rgba(34,197,94,.15);color:var(--green);border:1px solid rgba(34,197,94,.3)}
+.lm-st.off{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.lm-st.busy{background:rgba(234,179,8,.15);color:var(--yellow);border:1px solid rgba(234,179,8,.3)}
+
+/* LM Studio Metrics Grid */
+.lm-metrics{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:10px;flex-shrink:0;
+}
+.lm-metric{
+  background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
+  padding:8px 10px;display:flex;flex-direction:column;gap:2px;
+}
+.lm-mv{font-size:1.3rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.lm-ml{font-size:.65rem;color:var(--mm);text-transform:uppercase;letter-spacing:.05em}
+
+/* Prompt Progress */
+.lm-prompt{
+  display:flex;align-items:center;gap:8px;flex-shrink:0;
+  background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
+  padding:8px 12px;
+}
+.lm-pbar{flex:1;height:6px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;min-width:80px}
+.lm-pfill{height:100%;background:linear-gradient(90deg,var(--yellow),var(--orange));border-radius:3px;transition:width 0.3s ease-out}
+.lm-plbl{font-size:.7rem;color:var(--mm);white-space:nowrap;font-weight:500}
+
+/* Draft Stats */
+.lm-draft{
+  display:flex;gap:12px;align-items:center;flex-shrink:0;
+  background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
+  padding:8px 12px;
+}
+.lm-dv{font-size:.9rem;font-weight:600;font-variant-numeric:tabular-nums}
+.lm-dl{font-size:.6rem;color:var(--mm);text-transform:uppercase}
+
+/* Model Tags */
+.lm-tg{flex:1;display:flex;flex-wrap:wrap;gap:4px;overflow:hidden;min-height:0;padding-top:4px}
+.ltg{
+  font-size:.6rem;padding:3px 8px;border-radius:4px;white-space:nowrap;
+  background:rgba(59,130,246,.1);color:var(--blue);border:1px solid rgba(59,130,246,.15);
+}
+.ltg.loaded{background:rgba(34,197,94,.12);color:var(--green);border-color:rgba(34,197,94,.2)}
+
+/* Token Counters */
+.lm-tokens{
+  display:flex;gap:12px;margin-top:8px;padding-top:8px;
+  border-top:1px solid rgba(255,255,255,.05);
+}
+.lm-tc-item{
+  flex:1;display:flex;flex-direction:column;align-items:center;
+  padding:6px 8px;border-radius:6px;
+  background:rgba(255,255,255,.03);
+}
+.lm-tc-val{
+  font-size:1.1rem;font-weight:700;font-variant-numeric:tabular-nums;
+  color:var(--purple);
+}
+.lm-tc-lbl{
+  font-size:.55rem;color:var(--text-dim);margin-top:2px;
+  display:flex;align-items:center;gap:4px;
+}
+.lm-cost-inline{
+  color:var(--green);font-weight:600;font-size:.6rem;
+}
+.lm-reset{
+  background:rgba(255,255,255,.1);border:none;color:var(--text-dim);
+  cursor:pointer;padding:1px 5px;border-radius:3px;font-size:.6rem;
+  line-height:1;
+}
+.lm-reset:hover{
+  background:rgba(255,255,255,.2);color:var(--text);
+}
+
+/* Status badges */
+.status-idle{color:var(--green);font-weight:600}
+.status-processing{color:var(--yellow);font-weight:600;animation:pulse 1.5s ease-in-out infinite}
+.status-generating{color:var(--blue);font-weight:600;animation:pulse 1.5s ease-in-out infinite}
+.status-offline{color:var(--red);font-weight:600}
+
+@keyframes pulse{
+  0%,100%{opacity:1}
+  50%{opacity:.4}
+}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <h1>🦖 AI Beast Dashboard</h1>
+  <span class="badge" id="badge">● LIVE</span>
+  <span class="ht" id="tme">--:--:--</span>
+</div>
+
+<div class="main">
+
+  <!-- Row 1: GPU Cards -->
+  <div class="r-gpu" id="gpuRow"></div>
+
+  <!-- Row 2: Charts -->
+  <div class="r-charts">
+    <div class="ch"><canvas id="uC"></canvas></div>
+    <div class="ch"><canvas id="tC"></canvas></div>
+  </div>
+
+  <!-- Row 3: System -->
+  <div class="r-bot">
+    <div class="bc">
+      <div class="bi c">🔲</div>
+      <div style="flex:1">
+        <div class="bl">CPU</div>
+        <div class="bv" id="cv">--%</div>
+        <div class="bs" id="cs">-- cores · --°C</div>
+        <div class="bbar"><div class="bbf" id="cb" style="width:0%;background:var(--blue)"></div></div>
+      </div>
+    </div>
+    <div class="bc">
+      <div class="bi r">🧠</div>
+      <div style="flex:1">
+        <div class="bl">RAM</div>
+        <div class="bv" id="rv">--%</div>
+        <div class="bs" id="rs">-- / -- GiB</div>
+        <div class="bbar"><div class="bbf" id="rb" style="width:0%;background:var(--purple)"></div></div>
+      </div>
+    </div>
+    <div class="bc">
+      <div class="bi d">💾</div>
+      <div style="flex:1">
+        <div class="bl">DISK</div>
+        <div class="bv" id="dv">--%</div>
+        <div class="bs" id="ds">-- / -- GiB</div>
+        <div class="bbar"><div class="bbf" id="db" style="width:0%;background:var(--cyan)"></div></div>
+      </div>
+    </div>
+    <div class="bc">
+      <div class="bi l">⚡</div>
+      <div style="flex:1">
+        <div class="bl">POWER</div>
+        <div class="bv" id="pv">--W</div>
+        <div class="bs" id="ps">GPU Total</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row 4: LM Studio - mehr Platz -->
+  <div class="r-lm">
+    <div class="bc bc-lm">
+      <div class="lm-top">
+        <span class="lm-title">🤖 LM Studio <span class="lm-st" id="lms">checking</span></span>
+        <span class="lm-plbl" id="lmstatus"></span>
+      </div>
+      
+      <!-- Metrics Grid -->
+      <div class="lm-metrics">
+        <div class="lm-metric">
+          <span class="lm-mv" id="lt">--</span>
+          <span class="lm-ml">Token/sek</span>
+        </div>
+        <div class="lm-metric">
+          <span class="lm-mv" id="lp">--</span>
+          <span class="lm-ml">PP/sek</span>
+        </div>
+        <div class="lm-metric">
+          <span class="lm-mv" id="lq">0</span>
+          <span class="lm-ml">Warteschlange</span>
+        </div>
+        <div class="lm-metric">
+          <span class="lm-mv" id="lc">--</span>
+          <span class="lm-ml">geladene LLMs</span>
+        </div>
+      </div>
+
+      <!-- Prompt Progress -->
+      <div class="lm-prompt">
+        <span class="lm-plbl">Prompt Progress:</span>
+        <div class="lm-pbar"><div class="lm-pfill" id="lmp" style="width:0%"></div></div>
+        <span class="lm-plbl" id="lpp">--%</span>
+      </div>
+
+      <!-- Draft Stats -->
+      <div class="lm-draft">
+        <span class="lm-plbl">MTP Draft:</span>
+        <span><span class="lm-dv" id="lda">--</span> <span class="lm-dl">%</span></span>
+        <span><span class="lm-dv" id="ldr">--</span> <span class="lm-dl">akz</span></span>
+        <span><span class="lm-dv" id="ldr2">--</span> <span class="lm-dl">gen</span></span>
+      </div>
+
+      <!-- Token Counters + Costs -->
+      <div class="lm-tokens">
+        <div class="lm-tc-item">
+          <span class="lm-tc-val" id="ltc">0 / 0</span>
+          <span class="lm-tc-lbl">Gesamt (I/O) <span class="lm-cost-inline" id="lcost_total">€0.0000</span></span>
+        </div>
+        <div class="lm-tc-item">
+          <span class="lm-tc-val" id="lsc">0 / 0</span>
+          <span class="lm-tc-lbl">Session (I/O) <span class="lm-cost-inline" id="lcost_session">€0.0000</span> <button class="lm-reset" id="lreset" title="Reset">↻</button></span>
+        </div>
+      </div>
+
+      <!-- Model Tags -->
+      <div class="lm-tg" id="ltg"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const COL=['#3b82f6','#22c55e','#a855f7'];
+const tc=t=>t<60?'var(--green)':t<80?'var(--yellow)':'var(--red)';
+const vtc=t=>t<65?'var(--green)':t<80?'var(--yellow)':'var(--red)';
+const fmtNum=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n);
+
+// Reset session tokens button
+document.getElementById('lreset').addEventListener('click', async () => {
+  try {
+    await fetch('/api/reset-session-tokens', {method: 'POST'});
+  } catch(e) { console.error('Reset failed:', e); }
+});
+
+function buildGPUs(n){
+  const r=document.getElementById('gpuRow');r.innerHTML='';
+  for(let i=0;i<n;i++){
+    r.innerHTML+=`<div class="gpu">
+      <div class="gpu-hd"><span class="gpu-dot" style="background:${COL[i%3]}"></span><span class="gpu-nm" id="g${i}n">GPU ${i}</span></div>
+      <div class="gpu-bd">
+        <div class="gm"><span class="gm-l">⚡ Util</span><div class="gm-b"><div class="gm-f" id="g${i}u" style="width:0%;background:${COL[i%3]}"></div></div><span class="gm-v" id="g${i}ut">--%</span></div>
+        <div class="gm"><span class="gm-l">🌡 Temp</span><div class="gm-b"><div class="gm-f" id="g${i}t" style="width:0%;background:var(--green)"></div></div><span class="gm-v" id="g${i}tt">--°C</span></div>
+        <div class="gm"><span class="gm-l">🌡 Hot</span><span class="gm-v" id="g${i}ht" style="grid-column:2/4">--°C</span></div>
+        <div class="gm"><span class="gm-l">🧠 VRAM</span><div class="gm-b"><div class="gm-f" id="g${i}v" style="width:0%;background:var(--purple)"></div></div><span class="gm-v" id="g${i}vt">--</span></div>
+        <div class="gm"><span class="gm-l">🌡 VRAM</span><span class="gm-v" id="g${i}mt" style="grid-column:2/4">--°C</span></div>
+        <div class="gm"><span class="gm-l">🔌 Pwr</span><div class="gm-b"><div class="gm-f" id="g${i}p" style="width:0%;background:var(--orange)"></div></div><span class="gm-v" id="g${i}pt">--</span></div>
+        <div class="gm"><span class="gm-l">🎯 Clk</span><span class="gm-v" id="g${i}c" style="grid-column:2/4">-- MHz</span></div>
+      </div>
+    </div>`;
+  }
+}
+
+const MP=30;let uC,tC;
+function initCharts(n){
+  const o=(title,max)=>({
+    responsive:true,maintainAspectRatio:false,animation:{duration:200},
+    plugins:{
+      legend:{labels:{color:'#64748b',font:{size:11},boxWidth:8,padding:8}},
+      title:{display:true,text:title,color:'#94a3b8',font:{size:12,weight:'600'},padding:{bottom:4}},
+    },
+    scales:{
+      x:{display:false},
+      y:{min:0,max,grid:{color:'rgba(255,255,255,.04)'},ticks:{color:'#4a5568',font:{size:9},stepSize:max/4}},
+    },
+  });
+  uC=new Chart(document.getElementById('uC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Auslastung %',100)});
+  tC=new Chart(document.getElementById('tC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Temperatur °C',120)});
+  for(let i=0;i<n;i++){
+    [uC,tC].forEach(ch=>ch.data.datasets.push({
+      label:`GPU ${i}`,data:[],borderColor:COL[i%3],backgroundColor:COL[i%3]+'18',
+      borderWidth:2,pointRadius:0,tension:0.3,fill:true,
+    }));
+  }
+}
+
+function push(ch,vals){
+  const t=new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  ch.data.labels.push(t);
+  if(ch.data.labels.length>MP)ch.data.labels.shift();
+  vals.forEach((v,i)=>{
+    if(i<ch.data.datasets.length){
+      ch.data.datasets[i].data.push(v);
+      if(ch.data.datasets[i].data.length>MP)ch.data.datasets[i].data.shift();
+    }
+  });
+  ch.update();
+}
+
+// ─── SSE Connection ───────────────────────────────────────────────
+let evtSource;
+function connectSSE(){
+  evtSource=new EventSource('/sse');
+  evtSource.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    update(d);
+  };
+  evtSource.onerror=()=>{
+    evtSource.close();
+    document.getElementById('badge').textContent='● OFFLINE';
+    document.getElementById('badge').classList.add('off');
+    setTimeout(connectSSE,3000);
+  };
+}
+
+function update(d){
+  document.getElementById('badge').textContent='● LIVE';
+  document.getElementById('badge').classList.remove('off');
+  document.getElementById('tme').textContent=new Date().toLocaleTimeString('de-DE');
+  
+  // GPUs
+  d.gpus.forEach((g,i)=>{
+    const id=i;
+    document.getElementById(`g${id}n`).textContent=g.name;
+    document.getElementById(`g${id}u`).style.width=`${g.util_gpu}%`;
+    document.getElementById(`g${id}ut`).textContent=`${g.util_gpu}%`;
+    document.getElementById(`g${id}t`).style.width=`${(g.temperature/120)*100}%`;
+    document.getElementById(`g${id}tt`).textContent=`${g.temperature}°C`;
+    document.getElementById(`g${id}tt`).style.color=tc(g.temperature);
+    document.getElementById(`g${id}ht`).textContent=g.hotspot_temp!=null?`${g.hotspot_temp}°C`:'N/A';
+    document.getElementById(`g${id}ht`).style.color=tc(g.hotspot_temp);
+    document.getElementById(`g${id}v`).style.width=`${(g.mem_used/g.mem_total)*100}%`;
+    document.getElementById(`g${id}vt`).textContent=`${(g.mem_used/1024).toFixed(1)}/${(g.mem_total/1024).toFixed(0)} GiB`;
+    document.getElementById(`g${id}mt`).textContent=g.mem_temperature!=null?`${g.mem_temperature}°C`:'N/A';
+    document.getElementById(`g${id}mt`).style.color=vtc(g.mem_temperature);
+    document.getElementById(`g${id}p`).style.width=`${(g.power_draw/g.power_limit)*100}%`;
+    document.getElementById(`g${id}pt`).textContent=`${g.power_draw.toFixed(1)}W`;
+    document.getElementById(`g${id}c`).textContent=`${g.clock_graphics} MHz`;
+  });
+  
+  // Charts
+  push(uC,d.gpus.map(g=>g.util_gpu));
+  push(tC,d.gpus.map(g=>g.temperature));
+  
+  // System
+  const cpu=d.cpu;
+  document.getElementById('cv').textContent=`${cpu.percent}%`;
+  document.getElementById('cb').style.width=`${cpu.percent}%`;
+  document.getElementById('cs').textContent=`${cpu.cores} cores · ${cpu.temperature}°C`;
+  
+  const mem=d.memory;
+  document.getElementById('rv').textContent=`${mem.percent}%`;
+  document.getElementById('rb').style.width=`${mem.percent}%`;
+  document.getElementById('rs').textContent=`${mem.used_gb} / ${mem.total_gb} GiB`;
+  
+  const disk=d.disk;
+  document.getElementById('dv').textContent=`${disk.percent}%`;
+  document.getElementById('db').style.width=`${disk.percent}%`;
+  document.getElementById('ds').textContent=`${disk.used_gb} / ${disk.total_gb} GiB`;
+  
+  // Power
+  document.getElementById('pv').textContent=`${d.total_power}W`;
+  
+  // LM Studio
+  const lm=d.lm_studio;
+  const badge=document.getElementById('lms');
+  badge.textContent=lm.running?'● ONLINE':'● OFFLINE';
+  badge.className='lm-st '+(lm.running?'on':'off');
+  
+  // Log stats
+  const ls=lm.log_stats||{};
+  const tokS=ls.tokens_per_sec;
+  const pS=ls.prompt_tokens_per_sec;
+  const progress=ls.prompt_progress;
+  const draftAcc=ls.draft_acceptance;
+  const draftGen=ls.draft_generated;
+  const draftRate=ls.draft_rate;
+  
+  document.getElementById('lt').textContent=tokS!=null?tokS.toFixed(1):'0';
+  document.getElementById('lp').textContent=pS!=null?pS.toFixed(1):'0';
+  document.getElementById('lq').textContent=lm.queue_length!=null?lm.queue_length:0;
+  document.getElementById('lc').textContent=lm.loaded_models?lm.loaded_models.length:0;
+  
+  // Progress bar - reset when no active sessions
+  const pBar=document.getElementById('lmp');
+  const pLbl=document.getElementById('lpp');
+  const activeSessions=(lm.active_sessions||[]).filter(s=>s.status!=='completed');
+  if(activeSessions.length>0&&progress!=null&&progress>=0){
+    pBar.style.width=`${progress}%`;
+    pLbl.textContent=`${progress.toFixed(1)}%`;
+  } else {
+    pBar.style.width='0%';
+    pLbl.textContent='--';
+  }
+  
+  // Draft stats
+  document.getElementById('lda').textContent=draftRate!=null?draftRate.toFixed(1):'--';
+  document.getElementById('ldr').textContent=draftAcc!=null?Math.round(draftAcc*(draftGen||0)):'--';
+  document.getElementById('ldr2').textContent=draftGen!=null?draftGen:'--';
+  
+  // Token counters (split input/output)
+  document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
+  document.getElementById('lsc').textContent=fmtNum(lm.session_input_tokens||0)+' / '+fmtNum(lm.session_output_tokens||0);
+  
+  // Cost display
+  document.getElementById('lcost_total').textContent='€'+(lm.cost_total||0).toFixed(4);
+  document.getElementById('lcost_session').textContent='€'+(lm.cost_session||0).toFixed(4);
+  
+  // Status: Idle / Processing / Generating
+  const statusEl=document.getElementById('lmstatus');
+  if(!lm.running){
+    statusEl.textContent='OFFLINE';
+    statusEl.className='lm-plbl status-offline';
+  } else {
+    // Check for actively running sessions (not completed)
+    const activeSessions=(lm.active_sessions||[]).filter(s=>s.status!=='completed');
+    if(activeSessions.length>0){
+      const firstActive=activeSessions[0];
+      if(firstActive.status==='prompting'||(progress!=null&&progress>0&&progress<100)){
+        statusEl.textContent='⚡ PROCESSING PROMPT';
+        statusEl.className='lm-plbl status-processing';
+      } else if(firstActive.status==='generating'){
+        statusEl.textContent='⚡ GENERATING TOKENS';
+        statusEl.className='lm-plbl status-generating';
+      } else {
+        statusEl.textContent='● IDLE';
+        statusEl.className='lm-plbl status-idle';
+      }
+    } else {
+      statusEl.textContent='● IDLE';
+      statusEl.className='lm-plbl status-idle';
+    }
+  }
+  
+  // Model tags
+  const tg=document.getElementById('ltg');
+  tg.innerHTML='';
+  if(lm.loaded_models){
+    lm.loaded_models.forEach(m=>{
+      const t=document.createElement('span');
+      t.className='ltg loaded';
+      t.textContent=m;
+      tg.appendChild(t);
+    });
+  }
+}
+
+// Init
+fetch('/api/stats').then(r=>r.json()).then(d=>{
+  buildGPUs(d.gpus.length);
+  initCharts(d.gpus.length);
+  update(d);
+  connectSSE();
+});
+</script>
+</body>
+</html>

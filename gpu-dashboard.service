@@ -1,0 +1,15 @@
+[Unit]
+Description=GPU/LLM Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=georg
+WorkingDirectory=/home/georg/workspace/gpu-dashboard
+ExecStart=/home/georg/workspace/gpu-dashboard/venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/home/georg/workspace/gpu-dashboard/venv/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

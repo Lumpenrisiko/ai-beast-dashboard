@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Beast Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/gpu-dashboard
+ExecStart=/path/to/gpu-dashboard/venv/bin/python3 main.py
+Restart=always
+RestartSec=3
+
+# Environment variables (optional)
+# Environment=DASHBOARD_PORT=8083
+# Environment=LM_STUDIO_URL=http://localhost:11434
+# Environment=LM_STUDIO_LOG_DIR=/path/to/lmstudio/logs
+# Environment=LACT_ENABLED=false
+
+[Install]
+WantedBy=default.target
