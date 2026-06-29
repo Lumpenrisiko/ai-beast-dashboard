@@ -492,13 +492,16 @@ function update(d){
   }
   
   // Draft stats
-  document.getElementById('lda').textContent=draftRate!=null?draftRate.toFixed(1):'--';
-  document.getElementById('ldr').textContent=draftAcc!=null?Math.round(draftAcc*(draftGen||0)):'--';
+  document.getElementById('lda').textContent=draftAcc!=null?(draftAcc*100).toFixed(1):'--';
+  document.getElementById('ldr').textContent=ls.draft_accepted!=null?ls.draft_accepted:'--';
   document.getElementById('ldr2').textContent=draftGen!=null?draftGen:'--';
   
   // Token counters (split input/output)
+  // For Ollama: use log_stats session tokens
+  const sessIn = lm.session_input_tokens || ls.session_input_tokens || 0;
+  const sessOut = lm.session_output_tokens || ls.session_output_tokens || 0;
   document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
-  document.getElementById('lsc').textContent=fmtNum(lm.session_input_tokens||0)+' / '+fmtNum(lm.session_output_tokens||0);
+  document.getElementById('lsc').textContent=fmtNum(sessIn)+' / '+fmtNum(sessOut);
   
   // Cost display
   document.getElementById('lcost_total').textContent='€'+(lm.cost_total||0).toFixed(4);
@@ -512,6 +515,9 @@ function update(d){
   } else {
     // Check for actively running sessions (not completed)
     const activeSessions=(lm.active_sessions||[]).filter(s=>s.status!=='completed');
+    // For Ollama: use log_stats to determine status
+    const hasPrompting = ls.has_timing && pS!=null && pS>0;
+    const hasGenerating = ls.has_timing && tokS!=null && tokS>0;
     if(activeSessions.length>0){
       const firstActive=activeSessions[0];
       if(firstActive.status==='prompting'||(progress!=null&&progress>0&&progress<100)){
@@ -524,9 +530,16 @@ function update(d){
         statusEl.textContent='● IDLE';
         statusEl.className='lm-plbl status-idle';
       }
+    } else if(hasPrompting){
+      statusEl.textContent='⚡ PROCESSING PROMPT';
+      statusEl.className='lm-plbl status-processing';
+    } else if(hasGenerating){
+      statusEl.textContent='⚡ GENERATING TOKENS';
+      statusEl.className='lm-plbl status-generating';
     } else {
       statusEl.textContent='● IDLE';
       statusEl.className='lm-plbl status-idle';
+    }
     }
   }
   

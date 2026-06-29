@@ -966,6 +966,8 @@ async def _parse_ollama_logs() -> dict:
         "last_update": 0,
         "draft_acceptance_rate": 0,
         "draft_tokens": 0,
+        "session_input_tokens": 0,
+        "session_output_tokens": 0,
     }
     try:
         # Get recent logs (last 2 minutes)
@@ -977,6 +979,9 @@ async def _parse_ollama_logs() -> dict:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         lines = stdout.decode().split("\n")
 
+        total_input = 0
+        total_output = 0
+
         for line in lines:
             # Prompt processing: prompt processing, n_tokens = 4429, progress = 1.00, t = 8.71 s / 508.58 tokens per second
             m = re.search(r"prompt processing.*n_tokens\s*=\s*(\d+).*t\s*=\s*[\d.]+\s*s\s*/\s*([\d.]+)\s*tokens per second", line)
@@ -985,6 +990,7 @@ async def _parse_ollama_logs() -> dict:
                 result["prompt_tokens_per_sec"] = float(m.group(2))
                 result["has_timing"] = True
                 result["last_update"] = time.time()
+                total_input = max(total_input, int(m.group(1)))
 
             # Generation: n_decoded = 101, tg = 134.21 t/s
             m = re.search(r"n_decoded\s*=\s*(\d+).*tg\s*=\s*([\d.]+)\s*t/s", line)
@@ -993,6 +999,7 @@ async def _parse_ollama_logs() -> dict:
                 result["tokens_per_sec"] = float(m.group(2))
                 result["has_timing"] = True
                 result["last_update"] = time.time()
+                total_output = max(total_output, int(m.group(1)))
 
             # Progress: progress = 0.85
             m = re.search(r"progress\s*=\s*([\d.]+)", line)
@@ -1006,6 +1013,9 @@ async def _parse_ollama_logs() -> dict:
                 result["draft_accepted"] = int(m.group(2))
                 result["draft_generated"] = int(m.group(3))
                 result["draft_tokens"] = int(m.group(3))
+
+        result["session_input_tokens"] = total_input
+        result["session_output_tokens"] = total_output
 
     except Exception:
         pass
