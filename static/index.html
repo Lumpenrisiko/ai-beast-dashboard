@@ -262,14 +262,14 @@ body{
     </div>
   </div>
 
-  <!-- Row 4: LM Studio - mehr Platz -->
+  <!-- Row 4: AI Server - mehr Platz -->
   <div class="r-lm">
     <div class="bc bc-lm">
       <div class="lm-top">
-        <span class="lm-title">🤖 LM Studio <span class="lm-st" id="lms">checking</span></span>
+        <span class="lm-title" id="lmtitle">🤖 AI Server <span class="lm-st" id="lms">checking</span></span>
         <span class="lm-plbl" id="lmstatus"></span>
       </div>
-      
+
       <!-- Metrics Grid -->
       <div class="lm-metrics">
         <div class="lm-metric">
@@ -455,12 +455,16 @@ function update(d){
   // Power
   document.getElementById('pv').textContent=`${d.total_power}W`;
   
-  // LM Studio
+  // LM Studio / Ollama
   const lm=d.lm_studio;
   const badge=document.getElementById('lms');
   badge.textContent=lm.running?'● ONLINE':'● OFFLINE';
   badge.className='lm-st '+(lm.running?'on':'off');
-  
+
+  // Update title based on mode
+  const mode = lm.running ? (d.mode || 'AI Server') : 'AI Server';
+  document.getElementById('lmtitle').innerHTML = `🤖 ${mode} <span class="lm-st" id="lms">${badge.textContent}</span>`;
+
   // Log stats
   const ls=lm.log_stats||{};
   const tokS=ls.tokens_per_sec;

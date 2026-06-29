@@ -9,6 +9,9 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import aiohttp
 import psutil
 import uvicorn
@@ -19,7 +22,8 @@ from fastapi.staticfiles import StaticFiles
 # ─── Configuration (from environment variables) ───
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8083"))
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:11434")
+DASHBOARD_MODE = os.getenv("DASHBOARD_MODE", "lmstudio").lower()  # "lmstudio" or "ollama"
+LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", os.getenv("OLLAMA_URL", "http://localhost:11434"))
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
 LACT_ENABLED = os.getenv("LACT_ENABLED", "true").lower() == "true"
 STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "2"))
@@ -311,30 +315,49 @@ class LMStudioTracker:
                 sorted_models = sorted(recent.items(), key=lambda x: x[1])
                 loaded = [m for m, _ in sorted_models[:loaded_gpus]]
             elif loaded_gpus > 0:
-                # No recent sessions, get models from LM Studio API
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{LM_STUDIO_URL}/v1/models",
-                        timeout=aiohttp.ClientTimeout(total=5),
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            loaded = [m["id"] for m in data.get("data", [])[:loaded_gpus]]
+                # No recent sessions, get models from API
+                if DASHBOARD_MODE == "ollama":
+                    # Ollama: use /api/tags endpoint
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"{LM_STUDIO_URL}/api/tags",
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                loaded = [m["name"] for m in data.get("models", [])[:loaded_gpus]]
+                else:
+                    # LM Studio: use /v1/models endpoint
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"{LM_STUDIO_URL}/v1/models",
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                loaded = [m["id"] for m in data.get("data", [])[:loaded_gpus]]
         except Exception:
             pass
         return loaded
 
     async def get_models(self) -> list:
-        """Get list of available models from LM Studio."""
+        """Get list of available models from LM Studio or Ollama."""
         try:
             async with aiohttp.ClientSession() as session:
+                if DASHBOARD_MODE == "ollama":
+                    url = f"{LM_STUDIO_URL}/api/tags"
+                else:
+                    url = f"{LM_STUDIO_URL}/v1/models"
                 async with session.get(
-                    f"{LM_STUDIO_URL}/v1/models",
+                    url,
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return [m["id"] for m in data.get("data", [])]
+                        if DASHBOARD_MODE == "ollama":
+                            return [m["name"] for m in data.get("models", [])]
+                        else:
+                            return [m["id"] for m in data.get("data", [])]
         except Exception:
             pass
         return []
@@ -940,13 +963,28 @@ async def _collect_stats():
     lm_running = await tracker.is_running()
     lm_sessions = await tracker.get_active_stats() if lm_running else []
     lm_loaded = await tracker.get_loaded_models() if lm_running else []
-    
-    # Ensure log parser is running
-    if not log_parser._watch_task or log_parser._watch_task.done():
-        await log_parser.start_watching()
-    
-    lm_log = await log_parser.get_latest()
-    
+
+    # Log parser only for LM Studio mode
+    if DASHBOARD_MODE == "lmstudio":
+        # Ensure log parser is running
+        if not log_parser._watch_task or log_parser._watch_task.done():
+            await log_parser.start_watching()
+        lm_log = await log_parser.get_latest()
+    else:
+        # Ollama mode: no log parsing, use empty stats
+        lm_log = {
+            "prompt_progress": 0,
+            "tokens_per_sec": 0,
+            "prompt_tokens_per_sec": 0,
+            "n_decoded": 0,
+            "n_prompt": 0,
+            "model": "",
+            "has_timing": False,
+            "last_update": 0,
+            "draft_acceptance_rate": 0,
+            "draft_tokens": 0,
+        }
+
     # Merge session-based rates with log parser values
     # Session tracker has real-time tok/s from content samples
     # Use log parser values directly (no session override)
@@ -983,6 +1021,7 @@ async def _collect_stats():
 
     return {
         "timestamp": datetime.now().isoformat(),
+        "mode": "Ollama" if DASHBOARD_MODE == "ollama" else "LM Studio",
         "gpus": gpus,
         "cpu": cpu,
         "memory": mem,
