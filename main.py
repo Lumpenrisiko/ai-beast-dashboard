@@ -953,6 +953,58 @@ async def sse_stream():
     )
 
 
+async def _parse_ollama_logs() -> dict:
+    """Parse Ollama logs from journalctl for timing stats."""
+    result = {
+        "prompt_progress": 0,
+        "tokens_per_sec": 0,
+        "prompt_tokens_per_sec": 0,
+        "n_decoded": 0,
+        "n_prompt": 0,
+        "model": "",
+        "has_timing": False,
+        "last_update": 0,
+        "draft_acceptance_rate": 0,
+        "draft_tokens": 0,
+    }
+    try:
+        # Get recent logs (last 30 seconds)
+        proc = await asyncio.create_subprocess_exec(
+            "journalctl", "-u", "ollama.service", "--no-pager",
+            "--since", "30 seconds ago",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        lines = stdout.decode().split("\n")
+
+        for line in lines:
+            # Prompt processing: prompt processing, n_tokens = 4429, progress = 1.00, t = 8.71 s / 508.58 tokens per second
+            m = re.search(r"prompt processing.*n_tokens\s*=\s*(\d+).*t\s*=\s*[\d.]+\s*s\s*/\s*([\d.]+)\s*tokens per second", line)
+            if m:
+                result["n_prompt"] = int(m.group(1))
+                result["prompt_tokens_per_sec"] = float(m.group(2))
+                result["has_timing"] = True
+                result["last_update"] = time.time()
+
+            # Generation: n_decoded = 101, tg = 134.21 t/s
+            m = re.search(r"n_decoded\s*=\s*(\d+).*tg\s*=\s*([\d.]+)\s*t/s", line)
+            if m:
+                result["n_decoded"] = int(m.group(1))
+                result["tokens_per_sec"] = float(m.group(2))
+                result["has_timing"] = True
+                result["last_update"] = time.time()
+
+            # Progress: progress = 0.85
+            m = re.search(r"progress\s*=\s*([\d.]+)", line)
+            if m:
+                result["prompt_progress"] = float(m.group(1)) * 100
+
+    except Exception:
+        pass
+
+    return result
+
+
 async def _collect_stats():
     """Collect all stats in one go."""
     gpus = await get_gpu_stats()
@@ -971,19 +1023,8 @@ async def _collect_stats():
             await log_parser.start_watching()
         lm_log = await log_parser.get_latest()
     else:
-        # Ollama mode: no log parsing, use empty stats
-        lm_log = {
-            "prompt_progress": 0,
-            "tokens_per_sec": 0,
-            "prompt_tokens_per_sec": 0,
-            "n_decoded": 0,
-            "n_prompt": 0,
-            "model": "",
-            "has_timing": False,
-            "last_update": 0,
-            "draft_acceptance_rate": 0,
-            "draft_tokens": 0,
-        }
+        # Ollama mode: parse logs from journalctl
+        lm_log = await _parse_ollama_logs()
 
     # Merge session-based rates with log parser values
     # Session tracker has real-time tok/s from content samples
