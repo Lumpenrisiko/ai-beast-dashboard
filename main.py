@@ -968,10 +968,10 @@ async def _parse_ollama_logs() -> dict:
         "draft_tokens": 0,
     }
     try:
-        # Get recent logs (last 30 seconds)
+        # Get recent logs (last 2 minutes)
         proc = await asyncio.create_subprocess_exec(
             "journalctl", "-u", "ollama.service", "--no-pager",
-            "--since", "30 seconds ago",
+            "--since", "2 minutes ago",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
@@ -998,6 +998,14 @@ async def _parse_ollama_logs() -> dict:
             m = re.search(r"progress\s*=\s*([\d.]+)", line)
             if m:
                 result["prompt_progress"] = float(m.group(1)) * 100
+
+            # Draft stats: draft acceptance = 0.63827 (  457 accepted /   716 generated)
+            m = re.search(r"draft acceptance\s*=\s*([\d.]+)\s*\(\s*(\d+)\s+accepted\s*/\s*(\d+)\s+generated\)", line)
+            if m:
+                result["draft_acceptance_rate"] = float(m.group(1))
+                result["draft_accepted"] = int(m.group(2))
+                result["draft_generated"] = int(m.group(3))
+                result["draft_tokens"] = int(m.group(3))
 
     except Exception:
         pass
