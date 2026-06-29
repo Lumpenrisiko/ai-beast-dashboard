@@ -1070,11 +1070,19 @@ async def _collect_stats():
     # Calculate total power (sum of all GPU power draws)
     total_power = sum(g.get("power_draw", 0) for g in gpus if isinstance(g, dict))
 
-    # Calculate costs
-    total_input = tracker.get_total_input_tokens()
-    total_output = tracker.get_total_output_tokens()
-    session_input = tracker.get_session_input_tokens()
-    session_output = tracker.get_session_output_tokens()
+    # Calculate costs (use log_stats for Ollama mode)
+    if DASHBOARD_MODE == "ollama":
+        # Ollama: use log_stats session tokens for costs
+        total_input = lm_log.get("session_input_tokens", 0)
+        total_output = lm_log.get("session_output_tokens", 0)
+        session_input = total_input
+        session_output = total_output
+    else:
+        # LM Studio: use tracker values
+        total_input = tracker.get_total_input_tokens()
+        total_output = tracker.get_total_output_tokens()
+        session_input = tracker.get_session_input_tokens()
+        session_output = tracker.get_session_output_tokens()
     cost_total = (total_input * COST_INPUT_PER_M + total_output * COST_OUTPUT_PER_M) / 1_000_000
     cost_session = (session_input * COST_INPUT_PER_M + session_output * COST_OUTPUT_PER_M) / 1_000_000
 
