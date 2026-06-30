@@ -65,9 +65,12 @@ class LlmLogParser:
             # TTL tracking for real-time values
             "tok_s_time": 0,
             "p_s_time": 0,
-            # Cumulative token counters (for cost calculation)
+            # Cumulative token counters (persistent, never reset)
             "total_input_tokens": 0,
             "total_output_tokens": 0,
+            # Session token counters (resettable via /api/reset-session-tokens)
+            "session_input_tokens": 0,
+            "session_output_tokens": 0,
             # Queue tracking
             "queue_length": 0,
             "last_queue_update": 0,
@@ -234,8 +237,10 @@ class LlmLogParser:
             self._latest["p_s_time"] = time.time()
             self._latest["has_timing"] = True
             self._latest["last_update"] = time.time()
-            # Track cumulative input tokens
-            self._latest["total_input_tokens"] += int(m.group(2))
+            # Track cumulative input tokens (both total and session)
+            n_tokens = int(m.group(2))
+            self._latest["total_input_tokens"] += n_tokens
+            self._latest["session_input_tokens"] += n_tokens
             return
 
         # eval time = 2209.21 ms / 181 tokens (12.21 ms per token, 81.93 tokens per second)
@@ -247,8 +252,10 @@ class LlmLogParser:
             self._latest["tok_s_time"] = time.time()
             self._latest["has_timing"] = True
             self._latest["last_update"] = time.time()
-            # Track cumulative output tokens
-            self._latest["total_output_tokens"] += int(m.group(2))
+            # Track cumulative output tokens (both total and session)
+            n_tokens = int(m.group(2))
+            self._latest["total_output_tokens"] += n_tokens
+            self._latest["session_output_tokens"] += n_tokens
             return
 
         # draft acceptance = 0.82738 (139 accepted / 168 generated)
@@ -609,10 +616,10 @@ async def api_stats():
 
 @app.post("/api/reset-session-tokens")
 async def api_reset_session_tokens():
-    """Reset the session token counter."""
+    """Reset only the session token counter. Total counter persists."""
     async with log_parser._lock:
-        log_parser._latest["total_input_tokens"] = 0
-        log_parser._latest["total_output_tokens"] = 0
+        log_parser._latest["session_input_tokens"] = 0
+        log_parser._latest["session_output_tokens"] = 0
     return {"success": True}
 
 
@@ -689,7 +696,10 @@ async def _collect_stats():
     # Token counts and costs from log parser
     total_input = lm_log.get("total_input_tokens", 0)
     total_output = lm_log.get("total_output_tokens", 0)
+    session_input = lm_log.get("session_input_tokens", 0)
+    session_output = lm_log.get("session_output_tokens", 0)
     cost_total = (total_input * COST_INPUT_PER_M + total_output * COST_OUTPUT_PER_M) / 1_000_000
+    cost_session = (session_input * COST_INPUT_PER_M + session_output * COST_OUTPUT_PER_M) / 1_000_000
 
     return {
         "timestamp": datetime.now().isoformat(),
@@ -708,10 +718,10 @@ async def _collect_stats():
             "queue_length": lm_log.get("queue_length", 0),
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
-            "session_input_tokens": total_input,  # Same as total (no session reset)
-            "session_output_tokens": total_output,
+            "session_input_tokens": session_input,
+            "session_output_tokens": session_output,
             "cost_total": round(cost_total, 4),
-            "cost_session": round(cost_total, 4),
+            "cost_session": round(cost_session, 4),
             "cost_input_per_m": COST_INPUT_PER_M,
             "cost_output_per_m": COST_OUTPUT_PER_M,
         },
