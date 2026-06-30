@@ -269,6 +269,7 @@ body{
         <span class="lm-title" id="lmtitle">🤖 AI Server <span class="lm-st" id="lms">checking</span></span>
         <span class="lm-plbl" id="lmstatus"></span>
       </div>
+      <div class="lm-model-name" id="lmmodelname" style="font-size:13px;color:var(--text-dim);margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">--</div>
 
       <!-- Metrics Grid -->
       <div class="lm-metrics">
@@ -285,8 +286,12 @@ body{
           <span class="lm-ml">Warteschlange</span>
         </div>
         <div class="lm-metric">
-          <span class="lm-mv" id="lc">--</span>
-          <span class="lm-ml">geladene LLMs</span>
+          <span class="lm-mv" id="lc">0</span>
+          <span class="lm-ml">in VRAM</span>
+        </div>
+        <div class="lm-metric">
+          <span class="lm-mv" id="lav">0</span>
+          <span class="lm-ml">verfügbar</span>
         </div>
       </div>
 
@@ -469,22 +474,31 @@ function update(d){
   const ls=lm.log_stats||{};
   const tokS=ls.tokens_per_sec;
   const pS=ls.prompt_tokens_per_sec;
-  const progress=ls.prompt_progress;
-  const draftAcc=ls.draft_acceptance_rate;
+  const progress=ls.prompt_progress||0;
+  const draftAcc=ls.draft_acceptance;
   const draftGen=ls.draft_generated;
-  const draftRate=ls.draft_rate;
   
   document.getElementById('lt').textContent=tokS!=null?tokS.toFixed(1):'0';
   document.getElementById('lp').textContent=pS!=null?pS.toFixed(1):'0';
   document.getElementById('lq').textContent=lm.queue_length!=null?lm.queue_length:0;
-  document.getElementById('lc').textContent=lm.loaded_models?lm.loaded_models.length:0;
+  document.getElementById('lc').textContent=(lm.loaded_models||[]).length;
+  document.getElementById('lav').textContent=(lm.available_models||[]).length;
+
+  // Active model name (prefer loaded_models, fallback to log parser)
+  const modelEl = document.getElementById('lmmodelname');
+  if ((lm.loaded_models||[]).length > 0) {
+    modelEl.textContent = '📦 ' + lm.loaded_models.join(', ');
+  } else if (ls.model) {
+    modelEl.textContent = '📦 ' + ls.model;
+  } else {
+    modelEl.textContent = '--';
+  }
   
-  // Progress bar - reset when no active sessions
+  // Progress bar - based on log progress value
   const pBar=document.getElementById('lmp');
   const pLbl=document.getElementById('lpp');
-  const activeSessions=(lm.active_sessions||[]).filter(s=>s.status!=='completed');
-  if(activeSessions.length>0&&progress!=null&&progress>=0){
-    pBar.style.width=`${progress}%`;
+  if(progress>0){
+    pBar.style.width=`${Math.min(progress,100)}%`;
     pLbl.textContent=`${progress.toFixed(1)}%`;
   } else {
     pBar.style.width='0%';
@@ -497,40 +511,22 @@ function update(d){
   document.getElementById('ldr2').textContent=draftGen!=null?draftGen:'--';
   
   // Token counters (split input/output)
-  // For Ollama: use log_stats session tokens
-  const sessIn = lm.session_input_tokens || ls.session_input_tokens || 0;
-  const sessOut = lm.session_output_tokens || ls.session_output_tokens || 0;
   document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
-  document.getElementById('lsc').textContent=fmtNum(sessIn)+' / '+fmtNum(sessOut);
+  document.getElementById('lsc').textContent=fmtNum(lm.session_input_tokens||0)+' / '+fmtNum(lm.session_output_tokens||0);
   
   // Cost display
   document.getElementById('lcost_total').textContent='€'+(lm.cost_total||0).toFixed(4);
   document.getElementById('lcost_session').textContent='€'+(lm.cost_session||0).toFixed(4);
   
-  // Status: Idle / Processing / Generating
+  // Status: Idle / Processing / Generating (log-based)
   const statusEl=document.getElementById('lmstatus');
   if(!lm.running){
     statusEl.textContent='OFFLINE';
     statusEl.className='lm-plbl status-offline';
   } else {
-    // Check for actively running sessions (not completed)
-    const activeSessions=(lm.active_sessions||[]).filter(s=>s.status!=='completed');
-    // For Ollama: use log_stats to determine status
-    const hasPrompting = ls.has_timing && pS!=null && pS>0;
-    const hasGenerating = ls.has_timing && tokS!=null && tokS>0;
-    if(activeSessions.length>0){
-      const firstActive=activeSessions[0];
-      if(firstActive.status==='prompting'||(progress!=null&&progress>0&&progress<100)){
-        statusEl.textContent='⚡ PROCESSING PROMPT';
-        statusEl.className='lm-plbl status-processing';
-      } else if(firstActive.status==='generating'){
-        statusEl.textContent='⚡ GENERATING TOKENS';
-        statusEl.className='lm-plbl status-generating';
-      } else {
-        statusEl.textContent='● IDLE';
-        statusEl.className='lm-plbl status-idle';
-      }
-    } else if(hasPrompting){
+    const hasPrompting = ls.has_timing && pS!=null && pS>0 && progress<100;
+    const hasGenerating = ls.has_timing && tokS!=null && tokS>0 && progress>=100;
+    if(hasPrompting){
       statusEl.textContent='⚡ PROCESSING PROMPT';
       statusEl.className='lm-plbl status-processing';
     } else if(hasGenerating){
