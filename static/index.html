@@ -463,12 +463,14 @@ function update(d){
   // LM Studio / Ollama
   const lm=d.lm_studio;
   const badge=document.getElementById('lms');
-  badge.textContent=lm.running?'● ONLINE':'● OFFLINE';
-  badge.className='lm-st '+(lm.running?'on':'off');
+  const badgeText=lm.running?'● ONLINE':'● OFFLINE';
+  const badgeClass='lm-st '+(lm.running?'on':'off');
+  badge.textContent=badgeText;
+  badge.className=badgeClass;
 
   // Update title based on mode
   const mode = lm.running ? (d.mode || 'AI Server') : 'AI Server';
-  document.getElementById('lmtitle').innerHTML = `🤖 ${mode} <span class="lm-st" id="lms">${badge.textContent}</span>`;
+  document.getElementById('lmtitle').innerHTML = `🤖 ${mode} <span class="${badgeClass}" id="lms">${badgeText}</span>`;
 
   // Log stats
   const ls=lm.log_stats||{};
