@@ -61,6 +61,8 @@ class LlmLogParser:
         self._current_file = None
         self._position = 0
         self._last_mtime = 0
+        # Ollama journalctl cursor (prevents duplicate counting)
+        self._ollama_cursor = ""
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -187,17 +189,43 @@ class LlmLogParser:
             self._position = 0
 
     async def _poll_ollama_logs(self):
-        """Poll Ollama logs from journalctl."""
+        """Poll Ollama logs from journalctl using cursor to avoid duplicates."""
         try:
+            cmd = ["journalctl", "-u", "ollama.service", "--no-pager", "--output=cat"]
+            if self._ollama_cursor:
+                cmd.extend(["--cursor", self._ollama_cursor])
+            else:
+                # First run: only get recent logs (last 30s)
+                cmd.extend(["--since", "30 seconds ago"])
             proc = await asyncio.create_subprocess_exec(
-                "journalctl", "-u", "ollama.service", "--no-pager",
-                "--since", f"{self._ttl + 5} seconds ago",
+                *cmd,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            for line in stdout.decode().split("\n"):
+            output = stdout.decode()
+            if not output:
+                return
+            # Get the cursor from the last line for next poll
+            # journalctl outputs cursor on stderr with --output=json, but we can
+            # track by using the last timestamp as a marker instead
+            for line in output.split("\n"):
                 if line:
                     self._parse_line(line)
+            # Update cursor: get the cursor value from the latest journal entry
+            try:
+                cursor_proc = await asyncio.create_subprocess_exec(
+                    "journalctl", "-u", "ollama.service", "--no-pager",
+                    "--output=json", "--lines=1",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                cursor_out, _ = await asyncio.wait_for(cursor_proc.communicate(), timeout=2)
+                if cursor_out:
+                    lines = cursor_out.strip().split(b"\n")
+                    if lines:
+                        last_entry = json.loads(lines[-1])
+                        self._ollama_cursor = last_entry.get("__CURSOR", "")
+            except Exception:
+                pass
         except Exception:
             pass
 
