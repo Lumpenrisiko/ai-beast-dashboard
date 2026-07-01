@@ -28,6 +28,19 @@ DASHBOARD_MODE = os.getenv("DASHBOARD_MODE", "lmstudio").lower()  # "lmstudio" o
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
+# Auto-detect current month's log directory if not explicitly set
+if not LM_STUDIO_LOG_DIR:
+    _default_base = os.path.expanduser("~/.lmstudio/server-logs")
+    _current_month = datetime.now().strftime("%Y-%m")
+    _auto_dir = os.path.join(_default_base, _current_month)
+    if os.path.isdir(_auto_dir):
+        LM_STUDIO_LOG_DIR = _auto_dir
+    else:
+        # Fallback: find the most recent month directory
+        if os.path.isdir(_default_base):
+            months = sorted([d for d in os.listdir(_default_base) if os.path.isdir(os.path.join(_default_base, d))], reverse=True)
+            if months:
+                LM_STUDIO_LOG_DIR = os.path.join(_default_base, months[0])
 LACT_ENABLED = os.getenv("LACT_ENABLED", "true").lower() == "true"
 STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "2"))
 CHART_HISTORY = 60  # seconds of chart data to keep
