@@ -63,6 +63,8 @@ class LlmLogParser:
         self._last_mtime = 0
         # Ollama journalctl cursor (prevents duplicate counting)
         self._ollama_cursor = ""
+        # Track previous prompt_progress to detect new request start
+        self._prev_prompt_progress = 0
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -244,15 +246,35 @@ class LlmLogParser:
         # Prompt processing progress: 55.8%
         m = re.search(r"Prompt processing progress:\s*([\d.]+)%", line)
         if m:
-            self._latest["prompt_progress"] = float(m.group(1))
+            new_progress = float(m.group(1))
+            # Reset MTP draft stats when prompt processing starts (transition from idle)
+            if new_progress > 0 and self._prev_prompt_progress <= 0:
+                self._latest["draft_acceptance"] = 0
+                self._latest["draft_accepted"] = 0
+                self._latest["draft_generated"] = 0
+                self._latest["draft_rate"] = 0
+                self._latest["draft_tokens_generated"] = 0
+                self._latest["draft_tokens_accepted"] = 0
+            self._prev_prompt_progress = new_progress
+            self._latest["prompt_progress"] = new_progress
             self._latest["last_update"] = time.time()
             return
 
         # REAL-TIME: prompt processing, n_tokens = 57344, progress = 0.52, t = 49.08 s / 1168.47 tokens per second
         m = re.search(r"prompt processing.*?n_tokens\s*=\s*(\d+).*?progress\s*=\s*([\d.]+).*?t\s*=\s*[\d.]+\s*s\s*/\s*([\d.]+)\s*tokens per second", line)
         if m:
+            new_progress = float(m.group(2)) * 100
+            # Reset MTP draft stats when prompt processing starts (transition from idle)
+            if new_progress > 0 and self._prev_prompt_progress <= 0:
+                self._latest["draft_acceptance"] = 0
+                self._latest["draft_accepted"] = 0
+                self._latest["draft_generated"] = 0
+                self._latest["draft_rate"] = 0
+                self._latest["draft_tokens_generated"] = 0
+                self._latest["draft_tokens_accepted"] = 0
+            self._prev_prompt_progress = new_progress
             self._latest["prompt_tokens"] = int(m.group(1))
-            self._latest["prompt_progress"] = float(m.group(2)) * 100
+            self._latest["prompt_progress"] = new_progress
             self._latest["prompt_tokens_per_sec"] = float(m.group(3))
             self._latest["p_s_time"] = time.time()
             self._latest["has_timing"] = True
@@ -362,9 +384,17 @@ class LlmLogParser:
             if progress > 0 and progress < 100:
                 result["tokens_per_sec"] = 0
 
-            # Reset prompt_progress if idle
+            # Reset prompt_progress if idle (also reset draft stats + tracking)
             if now - result["last_update"] > 10 and not result["has_timing"]:
                 result["prompt_progress"] = 0
+                self._prev_prompt_progress = 0
+                # Reset MTP draft stats when idle (no active request)
+                result["draft_acceptance"] = 0
+                result["draft_accepted"] = 0
+                result["draft_generated"] = 0
+                result["draft_rate"] = 0
+                result["draft_tokens_generated"] = 0
+                result["draft_tokens_accepted"] = 0
 
             # Queue TTL: reset if no update for 15s
             if now - result.get("last_queue_update", 0) > 15:
