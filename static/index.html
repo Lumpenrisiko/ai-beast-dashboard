@@ -507,10 +507,12 @@ function update(d){
     pLbl.textContent='--';
   }
   
-  // Draft stats
-  document.getElementById('lda').textContent=draftAcc!=null?(draftAcc*100).toFixed(1):'--';
-  document.getElementById('ldr').textContent=ls.draft_accepted!=null?ls.draft_accepted:'--';
-  document.getElementById('ldr2').textContent=draftGen!=null?draftGen:'--';
+  // Draft stats (show -- when idle/reset)
+  const draftAccVal = ls.draft_acceptance;
+  const draftAccNum = (draftAccVal && draftAccVal > 0) ? (draftAccVal * 100).toFixed(1) : '--';
+  document.getElementById('lda').textContent=draftAccNum;
+  document.getElementById('ldr').textContent=(ls.draft_accepted||0)>0?ls.draft_accepted:'--';
+  document.getElementById('ldr2').textContent=(draftGen||0)>0?draftGen:'--';
   
   // Token counters (split input/output)
   document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
