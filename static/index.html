@@ -444,11 +444,13 @@ function update(d){
   // Charts
   push(uC,d.gpus.map(g=>g.util_gpu));
   push(tC,d.gpus.map(g=>g.temperature));
-  // Power chart: single line = total of all GPUs
-  const pChart=pC.data.datasets[0];
-  pChart.label='Total (W)';
-  pChart.data.push(d.gpus.reduce((s,g)=>s+(g.power_draw||0),0));
-  if(pChart.data.length>MP)pChart.data.shift();
+  // Power chart: single total line = sum of all GPUs
+  const now=new Date().toLocaleTimeString();
+  pC.data.labels.push(now);
+  if(pC.data.labels.length>MP)pC.data.labels.shift();
+  pC.data.datasets[0].data.push(d.gpus.reduce((s,g)=>s+(g.power_draw||0),0));
+  if(pC.data.datasets[0].data.length>MP)pC.data.datasets[0].data.shift();
+  pC.update('none');
   
   // System
   const cpu=d.cpu;
