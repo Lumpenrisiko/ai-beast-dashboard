@@ -507,12 +507,20 @@ function update(d){
     pLbl.textContent='--';
   }
   
-  // Draft stats (show -- when idle/reset)
+  // Draft stats (show -- when idle/reset; hide entirely in Unsloth mode)
   const draftAccVal = ls.draft_acceptance;
   const draftAccNum = (draftAccVal && draftAccVal > 0) ? (draftAccVal * 100).toFixed(1) : '--';
   document.getElementById('lda').textContent=draftAccNum;
   document.getElementById('ldr').textContent=(ls.draft_accepted||0)>0?ls.draft_accepted:'--';
   document.getElementById('ldr2').textContent=(draftGen||0)>0?draftGen:'--';
+
+  // Hide MTP Draft row in Unsloth mode (no draft stats available)
+  const draftRow = document.querySelector('.lm-draft');
+  if (draftRow && d.mode === 'Unsloth Studio') {
+    draftRow.style.display = 'none';
+  } else if (draftRow) {
+    draftRow.style.display = '';
+  }
   
   // Token counters (split input/output)
   document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
