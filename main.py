@@ -66,6 +66,10 @@ class LlmLogParser:
         self._ollama_cursor = ""
         # Track previous prompt_progress to detect new request start
         self._prev_prompt_progress = 0
+        # Unsloth mode: previous /metrics counter snapshot (None = not seeded yet)
+        self._unsloth_prev = None
+        self._unsloth_was_active = False
+        self._unsloth_model_check = 0
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -95,8 +99,11 @@ class LlmLogParser:
         }
         self._lock = asyncio.Lock()
         self._watch_task = None
-        # TTL in seconds - values expire after this
-        self._ttl = 5
+        # TTL in seconds - values expire after this.
+        # Unsloth/llama.cpp only publishes its counters when a request phase
+        # finishes, so a single scrape has to stay visible much longer than a
+        # log line (which arrives continuously while the request runs).
+        self._ttl = 15 if DASHBOARD_MODE == "unsloth" else 5
 
     async def start_watching(self):
         """Start watching logs."""
@@ -248,6 +255,25 @@ class LlmLogParser:
             pass
         return ""
 
+    @staticmethod
+    def _token_rate(d_tokens: float, d_seconds: float, gauge: float, dt_wall: float) -> float:
+        """Tokens/s for the work that completed since the previous scrape.
+
+        llama.cpp bumps its counters only when a request finishes a phase, so
+        the wall-clock poll interval is NOT the time the work took - dividing by
+        it turns a 40 s prompt eval into a ~100k tok/s reading. The server's own
+        time counters (ms precision) are the correct denominator.
+
+        Fallbacks: the per-scrape gauge (llama.cpp resets its metrics bucket on
+        every scrape, so it holds the average for exactly this window), then
+        wall-clock as a last resort.
+        """
+        if d_seconds > 0.001:
+            return d_tokens / d_seconds
+        if gauge > 0:
+            return gauge
+        return d_tokens / dt_wall
+
     async def _poll_unsloth_metrics(self):
         """Scrape Prometheus-style metrics from llama.cpp /metrics endpoint (Unsloth Studio)."""
         try:
@@ -276,59 +302,92 @@ class LlmLogParser:
 
             now = time.time()
             requests_processing = metrics.get("llamacpp:requests_processing", 0)
+            requests_deferred = metrics.get("llamacpp:requests_deferred", 0)
 
-            # Read cumulative counters
-            total_prompt = metrics.get("llamacpp:prompt_tokens_total", 0)
-            total_gen = metrics.get("llamacpp:tokens_predicted_total", 0)
+            # Cumulative counters: tokens and the time llama.cpp spent on them
+            snapshot = {
+                "prompt": metrics.get("llamacpp:prompt_tokens_total", 0),
+                "prompt_s": metrics.get("llamacpp:prompt_seconds_total", 0),
+                "gen": metrics.get("llamacpp:tokens_predicted_total", 0),
+                "gen_s": metrics.get("llamacpp:tokens_predicted_seconds_total", 0),
+                "time": now,
+            }
+            # Per-scrape average gauges (used as fallback)
+            gauge_prompt = metrics.get("llamacpp:prompt_tokens_seconds", 0)
+            gauge_gen = metrics.get("llamacpp:predicted_tokens_seconds", 0)
 
-            # Compute token rates from cumulative counters (delta / elapsed)
-            prev_prompt = self._latest.get("_unsloth_prev_prompt", 0)
-            prev_gen = self._latest.get("_unsloth_prev_gen", 0)
-            prev_time = self._latest.get("_unsloth_prev_time", now)
-            dt = max(now - prev_time, 0.001)
+            prev = self._unsloth_prev
+            # First scrape, or llama-server restarted (counters went backwards):
+            # only seed the baseline. Otherwise the whole server lifetime would
+            # be charged to a single 0.3 s poll interval.
+            restarted = prev is not None and (
+                snapshot["prompt"] < prev["prompt"] or snapshot["gen"] < prev["gen"]
+            )
+            if prev is None or restarted:
+                self._unsloth_prev = snapshot
+                self._latest["last_update"] = now
+                return
 
-            delta_prompt = int(total_prompt - prev_prompt)
-            delta_gen = int(total_gen - prev_gen)
+            dt_wall = max(now - prev["time"], 0.001)
+            delta_prompt = snapshot["prompt"] - prev["prompt"]
+            delta_gen = snapshot["gen"] - prev["gen"]
+            delta_prompt_s = snapshot["prompt_s"] - prev["prompt_s"]
+            delta_gen_s = snapshot["gen_s"] - prev["gen_s"]
 
-            # Rate in tokens/s (smoothed over poll interval)
             if delta_prompt > 0:
-                self._latest["prompt_tokens_per_sec"] = delta_prompt / dt
-                self._latest["p_s_time"] = now
+                rate = self._token_rate(delta_prompt, delta_prompt_s, gauge_prompt, dt_wall)
+                if rate > 0:
+                    self._latest["prompt_tokens_per_sec"] = rate
+                    self._latest["p_s_time"] = now
+                self._latest["prompt_tokens"] = int(delta_prompt)
+                self._latest["prompt_time_ms"] = delta_prompt_s * 1000.0
                 self._latest["has_timing"] = True
-                self._latest["prompt_progress"] = min(self._latest.get("prompt_progress", 50), 99)
+                # The counter only moves once the prompt is fully processed.
+                self._latest["prompt_progress"] = 100.0
+                self._latest["total_input_tokens"] += int(delta_prompt)
+                self._latest["session_input_tokens"] += int(delta_prompt)
+
             if delta_gen > 0:
-                self._latest["tokens_per_sec"] = delta_gen / dt
-                self._latest["tok_s_time"] = now
+                rate = self._token_rate(delta_gen, delta_gen_s, gauge_gen, dt_wall)
+                if rate > 0:
+                    self._latest["tokens_per_sec"] = rate
+                    self._latest["tok_s_time"] = now
+                self._latest["eval_tokens"] = int(delta_gen)
+                self._latest["eval_time_ms"] = delta_gen_s * 1000.0
                 self._latest["has_timing"] = True
                 self._latest["prompt_progress"] = 100.0
-
-            # Track cumulative token counters
-            if delta_prompt > 0:
-                self._latest["total_input_tokens"] += delta_prompt
-                self._latest["session_input_tokens"] += delta_prompt
-            if delta_gen > 0:
-                self._latest["total_output_tokens"] += delta_gen
-                self._latest["session_output_tokens"] += delta_gen
+                self._latest["total_output_tokens"] += int(delta_gen)
+                self._latest["session_output_tokens"] += int(delta_gen)
 
             n_tokens_max = metrics.get("llamacpp:n_tokens_max", 0)
             if n_tokens_max > 0:
                 self._latest["n_tokens_max"] = int(n_tokens_max)
 
-            is_active = requests_processing > 0
-            was_active = self._latest.get("_unsloth_was_active", False)
+            is_active = requests_processing > 0 or requests_deferred > 0
             if is_active:
-                self._latest["queue_length"] = int(requests_processing)
-            elif not was_active and not is_active:
+                self._latest["queue_length"] = int(requests_processing + requests_deferred)
+                self._latest["last_queue_update"] = now
+            else:
                 self._latest["queue_length"] = 0
 
-            if now - self._latest.get("_unsloth_model_check", 0) > 30:
-                await self._fetch_unsloth_model()
-                self._latest["_unsloth_model_check"] = now
+            # Idle reset. get_latest() cannot do this in Unsloth mode because
+            # last_update is refreshed on every scrape, so drive it from the
+            # server's own request state instead.
+            last_rate = max(self._latest.get("tok_s_time", 0), self._latest.get("p_s_time", 0))
+            if not is_active and now - last_rate > self._ttl:
+                self._latest["has_timing"] = False
+                self._latest["prompt_progress"] = 0
+                # Clear the stored rates too - get_latest() only masks expired
+                # values in its copy, so a stale reading could otherwise survive.
+                self._latest["tokens_per_sec"] = 0
+                self._latest["prompt_tokens_per_sec"] = 0
 
-            self._latest["_unsloth_prev_prompt"] = total_prompt
-            self._latest["_unsloth_prev_gen"] = total_gen
-            self._latest["_unsloth_prev_time"] = now
-            self._latest["_unsloth_was_active"] = is_active
+            if now - self._unsloth_model_check > 30:
+                await self._fetch_unsloth_model()
+                self._unsloth_model_check = now
+
+            self._unsloth_prev = snapshot
+            self._unsloth_was_active = is_active
             self._latest["last_update"] = now
         except Exception:
             pass
@@ -556,13 +615,17 @@ class LlmLogParser:
             if now - result.get("p_s_time", 0) > self._ttl:
                 result["prompt_tokens_per_sec"] = 0
 
-            # Context-based zeroing:
+            # Context-based zeroing (log-based modes only):
             # - When progress == 100% (generation): p/s should be 0
             # - When progress < 100% (prompt processing): tok/s should be 0
-            if progress >= 100:
-                result["prompt_tokens_per_sec"] = 0
-            if progress > 0 and progress < 100:
-                result["tokens_per_sec"] = 0
+            # In Unsloth mode both rates are measured independently from the
+            # /metrics counters and progress is always 100 once a prompt has
+            # been processed - applying this here would permanently hide p/s.
+            if DASHBOARD_MODE != "unsloth":
+                if progress >= 100:
+                    result["prompt_tokens_per_sec"] = 0
+                if progress > 0 and progress < 100:
+                    result["tokens_per_sec"] = 0
 
             # Reset prompt_progress if idle (also reset draft stats + tracking)
             if now - result["last_update"] > 10 and not result["has_timing"]:
