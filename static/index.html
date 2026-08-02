@@ -51,7 +51,7 @@ body{
 
 /* Row 2: Charts - kompakter */
 .r-charts{
-  flex:0 0 140px;display:grid;grid-template-columns:1fr 1fr;gap:8px;
+  flex:0 0 140px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
   min-height:0;overflow:hidden;
 }
 
@@ -221,6 +221,7 @@ body{
   <div class="r-charts">
     <div class="ch"><canvas id="uC"></canvas></div>
     <div class="ch"><canvas id="tC"></canvas></div>
+    <div class="ch"><canvas id="pC"></canvas></div>
   </div>
 
   <!-- Row 3: System -->
@@ -360,7 +361,7 @@ function buildGPUs(n){
   }
 }
 
-const MP=30;let uC,tC;
+const MP=30;let uC,tC,pC;
 function initCharts(n){
   const o=(title,max)=>({
     responsive:true,maintainAspectRatio:false,animation:{duration:200},
@@ -375,8 +376,9 @@ function initCharts(n){
   });
   uC=new Chart(document.getElementById('uC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Auslastung %',100)});
   tC=new Chart(document.getElementById('tC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Temperatur °C',120)});
+  pC=new Chart(document.getElementById('pC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Power (W)',450)});
   for(let i=0;i<n;i++){
-    [uC,tC].forEach(ch=>ch.data.datasets.push({
+    [uC,tC,pC].forEach(ch=>ch.data.datasets.push({
       label:`GPU ${i}`,data:[],borderColor:COL[i%3],backgroundColor:COL[i%3]+'18',
       borderWidth:2,pointRadius:0,tension:0.3,fill:true,
     }));
@@ -440,6 +442,7 @@ function update(d){
   // Charts
   push(uC,d.gpus.map(g=>g.util_gpu));
   push(tC,d.gpus.map(g=>g.temperature));
+  push(pC,d.gpus.map(g=>g.power_draw||0));
   
   // System
   const cpu=d.cpu;
