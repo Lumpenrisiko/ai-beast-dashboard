@@ -376,13 +376,15 @@ function initCharts(n){
   });
   uC=new Chart(document.getElementById('uC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Auslastung %',100)});
   tC=new Chart(document.getElementById('tC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Temperatur °C',120)});
-  pC=new Chart(document.getElementById('pC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Power (W)',450)});
+  pC=new Chart(document.getElementById('pC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Power (W)',1500)});
   for(let i=0;i<n;i++){
-    [uC,tC,pC].forEach(ch=>ch.data.datasets.push({
+    [uC,tC].forEach(ch=>ch.data.datasets.push({
       label:`GPU ${i}`,data:[],borderColor:COL[i%3],backgroundColor:COL[i%3]+'18',
       borderWidth:2,pointRadius:0,tension:0.3,fill:true,
     }));
   }
+  // Power chart: single total line (not per-GPU)
+  pC.data.datasets.push({label:'Total (W)',data:[],borderColor:'#f59e0b',backgroundColor:'#f59e0b18',borderWidth:2,pointRadius:0,tension:0.3,fill:true});
 }
 
 function push(ch,vals){
@@ -442,7 +444,11 @@ function update(d){
   // Charts
   push(uC,d.gpus.map(g=>g.util_gpu));
   push(tC,d.gpus.map(g=>g.temperature));
-  push(pC,d.gpus.map(g=>g.power_draw||0));
+  // Power chart: single line = total of all GPUs
+  const pChart=pC.data.datasets[0];
+  pChart.label='Total (W)';
+  pChart.data.push(d.gpus.reduce((s,g)=>s+(g.power_draw||0),0));
+  if(pChart.data.length>MP)pChart.data.shift();
   
   // System
   const cpu=d.cpu;
