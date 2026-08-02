@@ -23,10 +23,11 @@ from fastapi.staticfiles import StaticFiles
 # ─── Configuration (from environment variables) ───
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8083"))
-DASHBOARD_MODE = os.getenv("DASHBOARD_MODE", "lmstudio").lower()  # "lmstudio" or "ollama"
+DASHBOARD_MODE = os.getenv("DASHBOARD_MODE", "lmstudio").lower()  # "lmstudio", "ollama", or "unsloth"
 # Backend URLs (for API checks only, no proxy)
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+UNSLOTH_METRICS_PORT = int(os.getenv("UNSLOTH_METRICS_PORT", "0"))  # 0 = auto-detect from process
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
 # Auto-detect current month's log directory if not explicitly set
 if not LM_STUDIO_LOG_DIR:
@@ -131,12 +132,14 @@ class LlmLogParser:
         return None
 
     async def _watch_loop(self):
-        """Continuously read new log lines (LM Studio mode) or poll journalctl (Ollama mode)."""
+        """Continuously read new log lines (LM Studio mode) or poll journalctl (Ollama mode) or scrape metrics (Unsloth mode)."""
         while True:
             try:
                 await asyncio.sleep(0.3)
                 if DASHBOARD_MODE == "ollama":
                     await self._poll_ollama_logs()
+                elif DASHBOARD_MODE == "unsloth":
+                    await self._poll_unsloth_metrics()
                 else:
                     await self._watch_lmstudio_logs()
             except asyncio.CancelledError:
@@ -197,7 +200,6 @@ class LlmLogParser:
             if self._ollama_cursor:
                 cmd.extend(["--cursor", self._ollama_cursor])
             else:
-                # First run: only get recent logs (last 30s)
                 cmd.extend(["--since", "30 seconds ago"])
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -207,13 +209,9 @@ class LlmLogParser:
             output = stdout.decode()
             if not output:
                 return
-            # Get the cursor from the last line for next poll
-            # journalctl outputs cursor on stderr with --output=json, but we can
-            # track by using the last timestamp as a marker instead
             for line in output.split("\n"):
                 if line:
                     self._parse_line(line)
-            # Update cursor: get the cursor value from the latest journal entry
             try:
                 cursor_proc = await asyncio.create_subprocess_exec(
                     "journalctl", "-u", "ollama.service", "--no-pager",
@@ -228,6 +226,143 @@ class LlmLogParser:
                         self._ollama_cursor = last_entry.get("__CURSOR", "")
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    async def _get_unsloth_metrics_url(self) -> str:
+        """Auto-detect llama-server port from running process or use configured port."""
+        if UNSLOTH_METRICS_PORT > 0:
+            return f"http://127.0.0.1:{UNSLOTH_METRICS_PORT}/metrics"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ps", "aux",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            for line in stdout.decode().split("\n"):
+                if "llama-server" in line:
+                    m = re.search(r"--port\s+(\d+)", line)
+                    if m:
+                        return f"http://127.0.0.1:{m.group(1)}/metrics"
+        except Exception:
+            pass
+        return ""
+
+    async def _poll_unsloth_metrics(self):
+        """Scrape Prometheus-style metrics from llama.cpp /metrics endpoint (Unsloth Studio)."""
+        try:
+            url = await self._get_unsloth_metrics_url()
+            if not url:
+                return
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "--max-time", "3", url,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            text = stdout.decode()
+            if not text:
+                return
+
+            metrics = {}
+            for line in text.split("\n"):
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    try:
+                        metrics[parts[0]] = float(parts[1])
+                    except ValueError:
+                        pass
+
+            now = time.time()
+            tok_s = metrics.get("llamacpp:predicted_tokens_seconds", 0)
+            p_s = metrics.get("llamacpp:prompt_tokens_seconds", 0)
+            requests_processing = metrics.get("llamacpp:requests_processing", 0)
+
+            total_prompt = metrics.get("llamacpp:prompt_tokens_total", 0)
+            total_gen = metrics.get("llamacpp:tokens_predicted_total", 0)
+
+            prev_prompt = self._latest.get("_unsloth_prev_prompt", 0)
+            prev_gen = self._latest.get("_unsloth_prev_gen", 0)
+            delta_prompt = int(total_prompt - prev_prompt)
+            delta_gen = int(total_gen - prev_gen)
+
+            was_active = self._latest.get("has_timing", False)
+            is_active = requests_processing > 0
+
+            if is_active and not was_active:
+                self._latest["draft_acceptance"] = 0
+                self._latest["draft_accepted"] = 0
+                self._latest["draft_generated"] = 0
+                self._latest["draft_rate"] = 0
+
+            if tok_s > 0:
+                self._latest["tokens_per_sec"] = tok_s
+                self._latest["tok_s_time"] = now
+                self._latest["has_timing"] = True
+                self._latest["prompt_progress"] = 100.0
+            if p_s > 0:
+                self._latest["prompt_tokens_per_sec"] = p_s
+                self._latest["p_s_time"] = now
+                self._latest["has_timing"] = True
+                self._latest["prompt_progress"] = min(self._latest.get("prompt_progress", 50), 99)
+
+            if delta_prompt > 0:
+                self._latest["total_input_tokens"] += delta_prompt
+                self._latest["session_input_tokens"] += delta_prompt
+            if delta_gen > 0:
+                self._latest["total_output_tokens"] += delta_gen
+                self._latest["session_output_tokens"] += delta_gen
+
+            n_tokens_max = metrics.get("llamacpp:n_tokens_max", 0)
+            if n_tokens_max > 0:
+                self._latest["n_tokens_max"] = int(n_tokens_max)
+
+            if is_active:
+                self._latest["queue_length"] = int(requests_processing)
+            elif not was_active and not is_active:
+                self._latest["queue_length"] = 0
+
+            if now - self._latest.get("_unsloth_model_check", 0) > 30:
+                await self._fetch_unsloth_model()
+                self._latest["_unsloth_model_check"] = now
+
+            self._latest["_unsloth_prev_prompt"] = total_prompt
+            self._latest["_unsloth_prev_gen"] = total_gen
+            self._latest["last_update"] = now
+        except Exception:
+            pass
+
+    async def _fetch_unsloth_model(self):
+        """Fetch model name from llama.cpp /v1/models endpoint."""
+        try:
+            if UNSLOTH_METRICS_PORT > 0:
+                port = UNSLOTH_METRICS_PORT
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    "ps", "aux",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                port = None
+                for line in stdout.decode().split("\n"):
+                    if "llama-server" in line:
+                        m = re.search(r"--port\s+(\d+)", line)
+                        if m:
+                            port = int(m.group(1))
+                            break
+            if not port:
+                return
+            proc = await asyncio.create_subprocess_exec(
+                "curl", "-s", "--max-time", "3", f"http://127.0.0.1:{port}/v1/models",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            data = json.loads(stdout.decode())
+            models = data.get("data", []) or data.get("models", [])
+            if models:
+                model_id = models[0].get("id", models[0].get("name", ""))
+                self._latest["model"] = model_id
         except Exception:
             pass
 
@@ -361,6 +496,51 @@ class LlmLogParser:
         m = re.search(r"id\s+\d+\s*\|\s*task\s+\d+\s*\|.*?(qwen|gemma|llama|mistral|nemotron)[^\s|]*", line, re.IGNORECASE)
         if m and not self._latest["model"]:
             self._latest["model"] = m.group(0).split("|")[0].strip()
+
+        # Unsloth Studio JSON log: engine_stats with gen_tok_s and prompt_tok_s
+        if line.startswith("{") and "engine_stats" in line:
+            try:
+                entry = json.loads(line)
+                if entry.get("event") == "engine_stats":
+                    gen_tok_s = entry.get("gen_tok_s", 0)
+                    prompt_tok_s = entry.get("prompt_tok_s", 0)
+                    running = entry.get("running", 0)
+                    
+                    was_active = self._latest.get("has_timing", False)
+                    is_active = running > 0
+                    
+                    # Reset draft stats on new request start
+                    if is_active and not was_active:
+                        self._latest["draft_acceptance"] = 0
+                        self._latest["draft_accepted"] = 0
+                        self._latest["draft_generated"] = 0
+                        self._latest["draft_rate"] = 0
+                    
+                    if gen_tok_s and gen_tok_s > 0:
+                        self._latest["tokens_per_sec"] = gen_tok_s
+                        self._latest["tok_s_time"] = time.time()
+                        self._latest["has_timing"] = True
+                        self._latest["prompt_progress"] = 100.0
+                    
+                    if prompt_tok_s and prompt_tok_s > 0:
+                        self._latest["prompt_tokens_per_sec"] = prompt_tok_s
+                        self._latest["p_s_time"] = time.time()
+                        self._latest["has_timing"] = True
+                        if not (gen_tok_s and gen_tok_s > 0):
+                            self._latest["prompt_progress"] = min(self._latest.get("prompt_progress", 50), 99)
+                    
+                    self._latest["last_update"] = time.time()
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Unsloth Studio JSON log: model_loaded event
+        if line.startswith("{") and "model_loaded" in line:
+            try:
+                entry = json.loads(line)
+                if entry.get("event") == "model_loaded":
+                    self._latest["model"] = entry.get("model", "")
+            except (json.JSONDecodeError, KeyError):
+                pass
 
     async def get_latest(self) -> dict:
         """Get the latest parsed metrics with TTL expiration."""
@@ -590,10 +770,30 @@ async def get_disk_stats() -> dict:
 async def check_llm_running() -> bool:
     """Check if the LLM backend is running by querying its API."""
     try:
-        url = OLLAMA_URL if DASHBOARD_MODE == "ollama" else LM_STUDIO_URL
+        if DASHBOARD_MODE == "ollama":
+            url = f"{OLLAMA_URL}/v1/models"
+        elif DASHBOARD_MODE == "unsloth":
+            # Use configured port or auto-detect from process
+            if UNSLOTH_METRICS_PORT > 0:
+                url = f"http://127.0.0.1:{UNSLOTH_METRICS_PORT}/health"
+            else:
+                import subprocess as sp
+                result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
+                port = None
+                for line in result.stdout.split("\n"):
+                    if "llama-server" in line:
+                        m = re.search(r"--port\s+(\d+)", line)
+                        if m:
+                            port = int(m.group(1))
+                            break
+                if not port:
+                    return False
+                url = f"http://127.0.0.1:{port}/health"
+        else:
+            url = f"{LM_STUDIO_URL}/v1/models"
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{url}/v1/models",
+                url,
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 return resp.status == 200
@@ -605,7 +805,23 @@ async def get_loaded_models() -> list:
     """Get list of models currently loaded in VRAM (actively running)."""
     models = []
     try:
-        url = OLLAMA_URL if DASHBOARD_MODE == "ollama" else LM_STUDIO_URL
+        if DASHBOARD_MODE == "ollama":
+            url = f"{OLLAMA_URL}/api/ps"
+        elif DASHBOARD_MODE == "unsloth":
+            import subprocess as sp
+            result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
+            port = None
+            for line in result.stdout.split("\n"):
+                if "llama-server" in line:
+                    m = re.search(r"--port\s+(\d+)", line)
+                    if m:
+                        port = int(m.group(1))
+                        break
+            if not port:
+                return []
+            url = f"http://127.0.0.1:{port}/v1/models"
+        else:
+            url = f"{LM_STUDIO_URL}/v1/models"
         async with aiohttp.ClientSession() as session:
             # Ollama /api/ps shows models currently loaded in memory
             # LM Studio: no direct endpoint, infer from /v1/models + VRAM usage
@@ -774,7 +990,7 @@ async def _collect_stats():
 
     return {
         "timestamp": datetime.now().isoformat(),
-        "mode": "Ollama" if DASHBOARD_MODE == "ollama" else "LM Studio",
+        "mode": "Unsloth Studio" if DASHBOARD_MODE == "unsloth" else ("Ollama" if DASHBOARD_MODE == "ollama" else "LM Studio"),
         "gpus": gpus,
         "cpu": cpu,
         "memory": mem,
