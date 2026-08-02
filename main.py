@@ -275,38 +275,34 @@ class LlmLogParser:
                         pass
 
             now = time.time()
-            tok_s = metrics.get("llamacpp:predicted_tokens_seconds", 0)
-            p_s = metrics.get("llamacpp:prompt_tokens_seconds", 0)
             requests_processing = metrics.get("llamacpp:requests_processing", 0)
 
+            # Read cumulative counters
             total_prompt = metrics.get("llamacpp:prompt_tokens_total", 0)
             total_gen = metrics.get("llamacpp:tokens_predicted_total", 0)
 
+            # Compute token rates from cumulative counters (delta / elapsed)
             prev_prompt = self._latest.get("_unsloth_prev_prompt", 0)
             prev_gen = self._latest.get("_unsloth_prev_gen", 0)
+            prev_time = self._latest.get("_unsloth_prev_time", now)
+            dt = max(now - prev_time, 0.001)
+
             delta_prompt = int(total_prompt - prev_prompt)
             delta_gen = int(total_gen - prev_gen)
 
-            was_active = self._latest.get("has_timing", False)
-            is_active = requests_processing > 0
-
-            if is_active and not was_active:
-                self._latest["draft_acceptance"] = 0
-                self._latest["draft_accepted"] = 0
-                self._latest["draft_generated"] = 0
-                self._latest["draft_rate"] = 0
-
-            if tok_s > 0:
-                self._latest["tokens_per_sec"] = tok_s
-                self._latest["tok_s_time"] = now
-                self._latest["has_timing"] = True
-                self._latest["prompt_progress"] = 100.0
-            if p_s > 0:
-                self._latest["prompt_tokens_per_sec"] = p_s
+            # Rate in tokens/s (smoothed over poll interval)
+            if delta_prompt > 0:
+                self._latest["prompt_tokens_per_sec"] = delta_prompt / dt
                 self._latest["p_s_time"] = now
                 self._latest["has_timing"] = True
                 self._latest["prompt_progress"] = min(self._latest.get("prompt_progress", 50), 99)
+            if delta_gen > 0:
+                self._latest["tokens_per_sec"] = delta_gen / dt
+                self._latest["tok_s_time"] = now
+                self._latest["has_timing"] = True
+                self._latest["prompt_progress"] = 100.0
 
+            # Track cumulative token counters
             if delta_prompt > 0:
                 self._latest["total_input_tokens"] += delta_prompt
                 self._latest["session_input_tokens"] += delta_prompt
@@ -318,6 +314,8 @@ class LlmLogParser:
             if n_tokens_max > 0:
                 self._latest["n_tokens_max"] = int(n_tokens_max)
 
+            is_active = requests_processing > 0
+            was_active = self._latest.get("_unsloth_was_active", False)
             if is_active:
                 self._latest["queue_length"] = int(requests_processing)
             elif not was_active and not is_active:
@@ -329,6 +327,8 @@ class LlmLogParser:
 
             self._latest["_unsloth_prev_prompt"] = total_prompt
             self._latest["_unsloth_prev_gen"] = total_gen
+            self._latest["_unsloth_prev_time"] = now
+            self._latest["_unsloth_was_active"] = is_active
             self._latest["last_update"] = now
         except Exception:
             pass
