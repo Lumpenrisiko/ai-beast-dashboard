@@ -504,18 +504,32 @@ function update(d){
   const ltEl=document.getElementById('lt');
   const lpEl=document.getElementById('lp');
 
-  if(tokS!=null&&tokS>0){
-    ltEl.textContent=tokS.toFixed(1);
-    ltEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,nowTs,fadeSec).toFixed(2)})`;
+  if(lm.running){
+    if(tokS!=null&&tokS>0){
+      ltEl.textContent=tokS.toFixed(1);
+      ltEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,nowTs,fadeSec).toFixed(2)})`;
+    }else{
+      // Keep last value visible but faded (server online, no new rate)
+      if(!ltEl.dataset.last){ltEl.dataset.last=ltEl.textContent||'0';}
+      ltEl.style.color='rgba(255,255,255,0.35)';
+    }
   }else{
+    delete ltEl.dataset.last;
     ltEl.textContent='0';
     ltEl.style.color='rgba(255,255,255,0.35)';
   }
 
-  if(pS!=null&&pS>0){
-    lpEl.textContent=pS.toFixed(1);
-    lpEl.style.color=`rgba(255,255,255,${fadeAge(ls.p_s_time,nowTs,fadeSec).toFixed(2)})`;
+  if(lm.running){
+    if(pS!=null&&pS>0){
+      lpEl.textContent=pS.toFixed(1);
+      lpEl.style.color=`rgba(255,255,255,${fadeAge(ls.p_s_time,nowTs,fadeSec).toFixed(2)})`;
+    }else{
+      // Keep last value visible but faded (server online, no new rate)
+      if(!lpEl.dataset.last){lpEl.dataset.last=lpEl.textContent||'0';}
+      lpEl.style.color='rgba(255,255,255,0.35)';
+    }
   }else{
+    delete lpEl.dataset.last;
     lpEl.textContent='0';
     lpEl.style.color='rgba(255,255,255,0.35)';
   }

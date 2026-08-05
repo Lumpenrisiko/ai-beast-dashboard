@@ -370,17 +370,12 @@ class LlmLogParser:
             else:
                 self._latest["queue_length"] = 0
 
-            # Idle reset. get_latest() cannot do this in Unsloth mode because
-            # last_update is refreshed on every scrape, so drive it from the
-            # server's own request state instead.
+            # Idle reset: clear progress/timing flags but keep the last rates visible.
+            # The frontend will fade stale values and only show 0 when lm.running=false.
             last_rate = max(self._latest.get("tok_s_time", 0), self._latest.get("p_s_time", 0))
             if not is_active and now - last_rate > self._ttl:
                 self._latest["has_timing"] = False
                 self._latest["prompt_progress"] = 0
-                # Clear the stored rates too - get_latest() only masks expired
-                # values in its copy, so a stale reading could otherwise survive.
-                self._latest["tokens_per_sec"] = 0
-                self._latest["prompt_tokens_per_sec"] = 0
 
             if now - self._unsloth_model_check > 30:
                 await self._fetch_unsloth_model()
