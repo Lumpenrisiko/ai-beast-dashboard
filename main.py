@@ -643,10 +643,9 @@ class LlmLogParser:
             if now - result.get("last_queue_update", 0) > 15:
                 result["queue_length"] = 0
 
-            # Remove internal tracking fields from output
-            result.pop("tok_s_time", None)
-            result.pop("p_s_time", None)
+            # Remove internal tracking fields from API output
             result.pop("last_queue_update", None)
+            # Keep tok_s_time/p_s_time for frontend fade effect (stale value indicator)
 
             return result
 

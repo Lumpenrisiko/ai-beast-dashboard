@@ -483,16 +483,43 @@ function update(d){
   const mode = lm.running ? (d.mode || 'AI Server') : 'AI Server';
   document.getElementById('lmtitle').innerHTML = `🤖 ${mode} <span class="${badgeClass}" id="lms">${badgeText}</span>`;
 
-  // Log stats
+  // Log stats with fade effect for stale values
   const ls=lm.log_stats||{};
   const tokS=ls.tokens_per_sec;
   const pS=ls.prompt_tokens_per_sec;
   const progress=ls.prompt_progress||0;
   const draftAcc=ls.draft_acceptance;
   const draftGen=ls.draft_generated;
-  
-  document.getElementById('lt').textContent=tokS!=null?tokS.toFixed(1):'0';
-  document.getElementById('lp').textContent=pS!=null?pS.toFixed(1):'0';
+
+  // Fade helper: alpha from 1.0 (fresh) to 0.35 (stale) over [0..fadeSec] seconds
+  function fadeAge(ts,now,fadeSec){
+    if(!ts||ts<=0)return 0.35;
+    const age=(now-ts)/1000;
+    if(age<=0)return 1;
+    return Math.max(0.35,1-(age/fadeSec));
+  }
+  const now=Date.now()/1000; // Unix timestamp to match backend
+  const fadeSec=12; // seconds over which value fades from white to gray
+
+  const ltEl=document.getElementById('lt');
+  const lpEl=document.getElementById('lp');
+
+  if(tokS!=null&&tokS>0){
+    ltEl.textContent=tokS.toFixed(1);
+    ltEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,now,fadeSec).toFixed(2)})`;
+  }else{
+    ltEl.textContent='0';
+    ltEl.style.color='rgba(255,255,255,0.35)';
+  }
+
+  if(pS!=null&&pS>0){
+    lpEl.textContent=pS.toFixed(1);
+    lpEl.style.color=`rgba(255,255,255,${fadeAge(ls.p_s_time,now,fadeSec).toFixed(2)})`;
+  }else{
+    lpEl.textContent='0';
+    lpEl.style.color='rgba(255,255,255,0.35)';
+  }
+
   document.getElementById('lq').textContent=lm.queue_length!=null?lm.queue_length:0;
   document.getElementById('lc').textContent=(lm.loaded_models||[]).length;
   document.getElementById('lav').textContent=(lm.available_models||[]).length;
