@@ -492,13 +492,13 @@ function update(d){
   const draftGen=ls.draft_generated;
 
   // Fade helper: alpha from 1.0 (fresh) to 0.35 (stale) over [0..fadeSec] seconds
-  function fadeAge(ts,now,fadeSec){
+  function fadeAge(ts,nowTs,fadeSec){
     if(!ts||ts<=0)return 0.35;
-    const age=now-ts; // both in Unix seconds
+    const age=nowTs-ts; // both in Unix seconds
     if(age<=0)return 1;
     return Math.max(0.35,1-(age/fadeSec));
   }
-  const now=Date.now()/1000; // Unix timestamp to match backend
+  const nowTs=Date.now()/1000; // Unix timestamp to match backend (renamed from 'now' to avoid collision)
   const fadeSec=12; // seconds over which value fades from white to gray
 
   const ltEl=document.getElementById('lt');
@@ -506,7 +506,7 @@ function update(d){
 
   if(tokS!=null&&tokS>0){
     ltEl.textContent=tokS.toFixed(1);
-    ltEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,now,fadeSec).toFixed(2)})`;
+    ltEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,nowTs,fadeSec).toFixed(2)})`;
   }else{
     ltEl.textContent='0';
     ltEl.style.color='rgba(255,255,255,0.35)';
@@ -514,7 +514,7 @@ function update(d){
 
   if(pS!=null&&pS>0){
     lpEl.textContent=pS.toFixed(1);
-    lpEl.style.color=`rgba(255,255,255,${fadeAge(ls.p_s_time,now,fadeSec).toFixed(2)})`;
+    lpEl.style.color=`rgba(255,255,255,${fadeAge(ls.p_s_time,nowTs,fadeSec).toFixed(2)})`;
   }else{
     lpEl.textContent='0';
     lpEl.style.color='rgba(255,255,255,0.35)';
