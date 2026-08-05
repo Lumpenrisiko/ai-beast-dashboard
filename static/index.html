@@ -494,7 +494,7 @@ function update(d){
   // Fade helper: alpha from 1.0 (fresh) to 0.35 (stale) over [0..fadeSec] seconds
   function fadeAge(ts,now,fadeSec){
     if(!ts||ts<=0)return 0.35;
-    const age=(now-ts)/1000;
+    const age=now-ts; // both in Unix seconds
     if(age<=0)return 1;
     return Math.max(0.35,1-(age/fadeSec));
   }
