@@ -23,8 +23,35 @@ from fastapi.staticfiles import StaticFiles
 # ─── Configuration (from environment variables) ───
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8083"))
-# Runtime-configurable mode (can be changed via /api/set-mode)
-_DASHBOARD_CONFIG = {"mode": os.getenv("DASHBOARD_MODE", "lmstudio").lower()}
+# Runtime-configurable settings (persisted to config.json)
+_CONFIG_FILE = os.path.expanduser("~/.ai-beast-dashboard/config.json")
+
+def _load_config():
+    defaults = {
+        "mode": os.getenv("DASHBOARD_MODE", "lmstudio").lower(),
+        "lm_studio_url": os.getenv("LM_STUDIO_URL", "http://localhost:1234"),
+        "ollama_url": os.getenv("OLLAMA_URL", "http://localhost:11434"),
+        "unsloth_metrics_port": int(os.getenv("UNSLOTH_METRICS_PORT", "0")),  # 0 = auto-detect
+    }
+    try:
+        with open(_CONFIG_FILE, "r") as f:
+            saved = json.load(f)
+        for k in defaults:
+            if k in saved:
+                defaults[k] = saved[k]
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return defaults
+
+_DASHBOARD_CONFIG = _load_config()
+
+def _save_config():
+    try:
+        os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
+        with open(_CONFIG_FILE, "w") as f:
+            json.dump(_DASHBOARD_CONFIG, f, indent=2)
+    except Exception:
+        pass
 
 def get_dashboard_mode():
     return _DASHBOARD_CONFIG["mode"]
@@ -36,9 +63,52 @@ def set_dashboard_mode(mode: str):
         raise ValueError(f"Invalid mode '{mode}'. Must be one of {valid_modes}")
     old_mode = _DASHBOARD_CONFIG["mode"]
     _DASHBOARD_CONFIG["mode"] = mode
+    _save_config()
     return {"previous": old_mode, "current": mode}
 
-# Backward compat alias — always reads current value from config dict
+def get_lm_studio_url():
+    return _DASHBOARD_CONFIG.get("lm_studio_url", "http://localhost:1234")
+
+def set_lm_studio_url(url: str):
+    url = url.strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    old = _DASHBOARD_CONFIG["lm_studio_url"]
+    _DASHBOARD_CONFIG["lm_studio_url"] = url
+    _save_config()
+    return {"previous": old, "current": url}
+
+def get_ollama_url():
+    return _DASHBOARD_CONFIG.get("ollama_url", "http://localhost:11434")
+
+def set_ollama_url(url: str):
+    url = url.strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    old = _DASHBOARD_CONFIG["ollama_url"]
+    _DASHBOARD_CONFIG["ollama_url"] = url
+    _save_config()
+    return {"previous": old, "current": url}
+
+def get_unsloth_port():
+    return int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0))
+
+def set_unsloth_port(port: int):
+    port = max(0, min(65535, int(port)))
+    old = _DASHBOARD_CONFIG["unsloth_metrics_port"]
+    _DASHBOARD_CONFIG["unsloth_metrics_port"] = port
+    _save_config()
+    return {"previous": old, "current": port}
+
+def get_all_settings():
+    return {
+        "mode": _DASHBOARD_CONFIG["mode"],
+        "lm_studio_url": _DASHBOARD_CONFIG.get("lm_studio_url", "http://localhost:1234"),
+        "ollama_url": _DASHBOARD_CONFIG.get("ollama_url", "http://localhost:11434"),
+        "unsloth_metrics_port": int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0)),
+    }
+
+# Backward compat aliases — always read current value from config dict
 class DashboardModeProxy:
     def __eq__(self, other):
         return get_dashboard_mode() == other
@@ -47,10 +117,30 @@ class DashboardModeProxy:
     def __str__(self):
         return get_dashboard_mode()
 DASHBOARD_MODE = DashboardModeProxy()
-# Backend URLs (for API checks only, no proxy)
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-UNSLOTH_METRICS_PORT = int(os.getenv("UNSLOTH_METRICS_PORT", "0"))  # 0 = auto-detect from process
+
+# Backward compat URL aliases (used throughout code)
+class UrlProxy:
+    def __init__(self, getter):
+        self._getter = getter
+    def __str__(self):
+        return self._getter()
+    def __repr__(self):
+        return str(self)
+LM_STUDIO_URL = UrlProxy(get_lm_studio_url)
+OLLAMA_URL = UrlProxy(get_ollama_url)
+
+class PortProxy:
+    def __init__(self, getter):
+        self._getter = getter
+    def __int__(self):
+        return self._getter()
+    def __float__(self):
+        return float(self._getter())
+    def __gt__(self, other):
+        return self._getter() > other
+    def __eq__(self, other):
+        return self._getter() == other
+UNSLOTH_METRICS_PORT = PortProxy(get_unsloth_port)
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
 # Auto-detect current month's log directory if not explicitly set
 if not LM_STUDIO_LOG_DIR:
@@ -1011,6 +1101,45 @@ async def api_set_mode(mode: str):
                 log_parser._ollama_cursor = ""
         return {"success": True, **result}
     except ValueError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/settings")
+async def api_get_settings():
+    """Get current runtime settings (mode, URLs, ports)."""
+    return get_all_settings()
+
+
+@app.post("/api/set-lm-studio-url")
+async def api_set_lm_studio_url(url: str):
+    """Set LM Studio server URL at runtime."""
+    try:
+        result = set_lm_studio_url(url)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/set-ollama-url")
+async def api_set_ollama_url(url: str):
+    """Set Ollama server URL at runtime."""
+    try:
+        result = set_ollama_url(url)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/set-unsloth-port")
+async def api_set_unsloth_port(port: int):
+    """Set Unsloth Studio llama-server port at runtime (0 = auto-detect)."""
+    try:
+        result = set_unsloth_port(port)
+        return {"success": True, **result}
+    except Exception as e:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -42,7 +42,37 @@ body{
   cursor:pointer;font-family:inherit;outline:none;
 }
 .mode-select:hover{background:rgba(255,255,255,.1)}
-.mode-select option{background:#111827;color:#e2e8f0}
+.mode-select option{background:#111827;color:#e2e8f0}.settings-btn{
+  font-size:.9rem;padding:4px 8px;border-radius:6px;cursor:pointer;
+  background:rgba(255,255,255,.06);border:1px solid var(--border);color:var(--t);
+}
+.settings-btn:hover{background:rgba(255,255,255,.1)}
+
+/* Settings Modal */
+.modal-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);
+  display:flex;align-items:center;justify-content:center;z-index:999;
+}
+.modal-box{
+  background:#111827;border:1px solid var(--border);border-radius:12px;
+  padding:20px 24px;width:380px;max-width:90vw;color:var(--t);
+}
+.modal-title{font-size:1rem;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;gap:10px}
+.modal-label{font-size:.75rem;color:var(--m);flex-shrink:0;width:90px}
+.modal-input{
+  flex:1;font-size:.8rem;padding:6px 8px;border-radius:6px;
+  background:rgba(255,255,255,.06);border:1px solid var(--border);color:var(--t);font-family:inherit;
+}
+.modal-input:focus{outline:none;border-color:var(--blue)}
+.modal-hint{font-size:.6rem;color:var(--mm);margin-top:4px;margin-bottom:8px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
+.modal-btn{
+  font-size:.75rem;padding:6px 14px;border-radius:6px;cursor:pointer;font-family:inherit;
+}
+.modal-btn.primary{background:var(--blue);color:#fff;border:none}
+.modal-btn.secondary{background:rgba(255,255,255,.08);color:var(--t);border:1px solid var(--border)}
+.modal-btn:hover{opacity:.9}
 
 /* Main: 4 rows */
 .main{
@@ -214,6 +244,7 @@ body{
 
 <div class="hdr">
   <h1>🦖 AI Beast Dashboard</h1>
+  <button class="settings-btn" id="settingsBtn" title="Server-Einstellungen">⚙️</button>
   <select class="mode-select" id="modeSelect" title="LLM Datenquelle wechseln">
     <option value="unsloth">Unsloth Studio</option>
     <option value="lmstudio">LM Studio</option>
@@ -341,6 +372,36 @@ body{
 
 </div>
 
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-title">⚙️ Server-Einstellungen</div>
+    
+    <div class="modal-row">
+      <span class="modal-label">LM Studio:</span>
+      <input type="text" class="modal-input" id="lmStudioUrlInput" placeholder="http://localhost:1234">
+    </div>
+    <div class="modal-hint">URL des LM Studio Servers (z.B. http://10.0.0.249:8888)</div>
+
+    <div class="modal-row">
+      <span class="modal-label">Ollama:</span>
+      <input type="text" class="modal-input" id="ollamaUrlInput" placeholder="http://localhost:11434">
+    </div>
+    <div class="modal-hint">URL des Ollama Servers (z.B. http://10.0.0.240:11434)</div>
+
+    <div class="modal-row">
+      <span class="modal-label">Unsloth Port:</span>
+      <input type="number" class="modal-input" id="unslothPortInput" placeholder="0 = auto" min="0" max="65535" style="width:120px">
+    </div>
+    <div class="modal-hint">Port des llama-server (0 = automatisch erkennen)</div>
+
+    <div class="modal-actions">
+      <button class="modal-btn secondary" id="settingsCancelBtn">Abbrechen</button>
+      <button class="modal-btn primary" id="settingsSaveBtn">Speichern</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const COL=['#3b82f6','#22c55e','#a855f7'];
 const tc=t=>t<60?'var(--green)':t<80?'var(--yellow)':'var(--red)';
@@ -371,6 +432,45 @@ document.getElementById('modeSelect').addEventListener('change', async (e) => {
     console.error('Mode switch failed:', e);
     e.target.value = currentMode;
   }
+});
+
+// Settings Modal - open/close/save
+const settingsModal = document.getElementById('settingsModal');
+document.getElementById('settingsBtn').addEventListener('click', async () => {
+  try {
+    const resp = await fetch('/api/settings');
+    if (resp.ok) {
+      const s = await resp.json();
+      document.getElementById('lmStudioUrlInput').value = s.lm_studio_url || '';
+      document.getElementById('ollamaUrlInput').value = s.ollama_url || '';
+      document.getElementById('unslothPortInput').value = s.unsloth_metrics_port ?? 0;
+    }
+  } catch(e) { console.error('Failed to load settings:', e); }
+  settingsModal.style.display = 'flex';
+});
+
+document.getElementById('settingsCancelBtn').addEventListener('click', () => {
+  settingsModal.style.display = 'none';
+});
+
+// Close on overlay click
+settingsModal.addEventListener('click', (e) => {
+  if (e.target === settingsModal) settingsModal.style.display = 'none';
+});
+
+document.getElementById('settingsSaveBtn').addEventListener('click', async () => {
+  const lmUrl = document.getElementById('lmStudioUrlInput').value.trim();
+  const ollamaUrl = document.getElementById('ollamaUrlInput').value.trim();
+  const unslothPort = parseInt(document.getElementById('unslothPortInput').value) || 0;
+
+  try {
+    if (lmUrl) await fetch('/api/set-lm-studio-url?url=' + encodeURIComponent(lmUrl), {method: 'POST'});
+    if (ollamaUrl) await fetch('/api/set-ollama-url?url=' + encodeURIComponent(ollamaUrl), {method: 'POST'});
+    await fetch('/api/set-unsloth-port?port=' + unslothPort, {method: 'POST'});
+    console.log('Settings saved');
+  } catch(e) { console.error('Failed to save settings:', e); }
+
+  settingsModal.style.display = 'none';
 });
 
 function buildGPUs(n){
