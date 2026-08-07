@@ -36,7 +36,13 @@ body{
   background:rgba(34,197,94,.15);color:var(--green);border:1px solid rgba(34,197,94,.3);
 }
 .badge.off{background:rgba(239,68,68,.15);color:var(--red);border-color:rgba(239,68,68,.3)}
-.ht{font-size:.8rem;color:var(--mm);font-variant-numeric:tabular-nums}
+.ht{font-size:.8rem;color:var(--mm);font-variant-numeric:tabular-nums}.mode-select{
+  font-size:.7rem;padding:3px 8px;border-radius:6px;
+  background:rgba(255,255,255,.06);color:var(--t);border:1px solid var(--border);
+  cursor:pointer;font-family:inherit;outline:none;
+}
+.mode-select:hover{background:rgba(255,255,255,.1)}
+.mode-select option{background:#111827;color:#e2e8f0}
 
 /* Main: 4 rows */
 .main{
@@ -208,6 +214,11 @@ body{
 
 <div class="hdr">
   <h1>🦖 AI Beast Dashboard</h1>
+  <select class="mode-select" id="modeSelect" title="LLM Datenquelle wechseln">
+    <option value="unsloth">Unsloth Studio</option>
+    <option value="lmstudio">LM Studio</option>
+    <option value="ollama">Ollama</option>
+  </select>
   <span class="badge" id="badge">● LIVE</span>
   <span class="ht" id="tme">--:--:--</span>
 </div>
@@ -343,6 +354,25 @@ document.getElementById('lreset').addEventListener('click', async () => {
   } catch(e) { console.error('Reset failed:', e); }
 });
 
+// Mode selector - switch LLM data source at runtime
+document.getElementById('modeSelect').addEventListener('change', async (e) => {
+  const mode = e.target.value;
+  try {
+    const resp = await fetch('/api/set-mode?mode=' + encodeURIComponent(mode), {method: 'POST'});
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      console.error('Mode switch failed:', err.detail || err);
+      e.target.value = currentMode;
+    } else {
+      const data = await resp.json();
+      console.log('Switched mode:', data.previous, '→', data.current);
+    }
+  } catch(e) {
+    console.error('Mode switch failed:', e);
+    e.target.value = currentMode;
+  }
+});
+
 function buildGPUs(n){
   const r=document.getElementById('gpuRow');r.innerHTML='';
   for(let i=0;i<n;i++){
@@ -416,10 +446,23 @@ function connectSSE(){
   };
 }
 
+let currentMode = 'unsloth'; // will be synced from server on first update
+
 function update(d){
   document.getElementById('badge').textContent='● LIVE';
   document.getElementById('badge').classList.remove('off');
   document.getElementById('tme').textContent=new Date().toLocaleTimeString('de-DE');
+  
+  // Sync mode selector with server mode (map display name to internal value)
+  const serverMode = d.mode || '';
+  let newMode;
+  if(serverMode.includes('Unsloth')) newMode='unsloth';
+  else if(serverMode.includes('Ollama')) newMode='ollama';
+  else newMode='lmstudio';
+  if(newMode !== currentMode){
+    currentMode = newMode;
+    document.getElementById('modeSelect').value = currentMode;
+  }
   
   // GPUs
   d.gpus.forEach((g,i)=>{

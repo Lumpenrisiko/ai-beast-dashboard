@@ -23,7 +23,30 @@ from fastapi.staticfiles import StaticFiles
 # ─── Configuration (from environment variables) ───
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8083"))
-DASHBOARD_MODE = os.getenv("DASHBOARD_MODE", "lmstudio").lower()  # "lmstudio", "ollama", or "unsloth"
+# Runtime-configurable mode (can be changed via /api/set-mode)
+_DASHBOARD_CONFIG = {"mode": os.getenv("DASHBOARD_MODE", "lmstudio").lower()}
+
+def get_dashboard_mode():
+    return _DASHBOARD_CONFIG["mode"]
+
+def set_dashboard_mode(mode: str):
+    valid_modes = ("lmstudio", "ollama", "unsloth")
+    mode = mode.lower().strip()
+    if mode not in valid_modes:
+        raise ValueError(f"Invalid mode '{mode}'. Must be one of {valid_modes}")
+    old_mode = _DASHBOARD_CONFIG["mode"]
+    _DASHBOARD_CONFIG["mode"] = mode
+    return {"previous": old_mode, "current": mode}
+
+# Backward compat alias — always reads current value from config dict
+class DashboardModeProxy:
+    def __eq__(self, other):
+        return get_dashboard_mode() == other
+    def __ne__(self, other):
+        return not self.__eq__(other)
+    def __str__(self):
+        return get_dashboard_mode()
+DASHBOARD_MODE = DashboardModeProxy()
 # Backend URLs (for API checks only, no proxy)
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
@@ -103,7 +126,7 @@ class LlmLogParser:
         # Unsloth/llama.cpp only publishes its counters when a request phase
         # finishes, so a single scrape has to stay visible much longer than a
         # log line (which arrives continuously while the request runs).
-        self._ttl = 15 if DASHBOARD_MODE == "unsloth" else 5
+        self._ttl = 15 if get_dashboard_mode() == "unsloth" else 5
 
     async def start_watching(self):
         """Start watching logs."""
@@ -965,6 +988,31 @@ async def api_reset_session_tokens():
         log_parser._latest["session_input_tokens"] = 0
         log_parser._latest["session_output_tokens"] = 0
     return {"success": True}
+
+
+@app.post("/api/set-mode")
+async def api_set_mode(mode: str):
+    """Switch LLM data source at runtime (lmstudio, ollama, unsloth)."""
+    try:
+        result = set_dashboard_mode(mode)
+        # Reset parser state so new mode starts clean
+        async with log_parser._lock:
+            log_parser._latest["tokens_per_sec"] = 0
+            log_parser._latest["prompt_tokens_per_sec"] = 0
+            log_parser._latest["has_timing"] = False
+            log_parser._latest["prompt_progress"] = 0
+            log_parser._latest["tok_s_time"] = 0
+            log_parser._latest["p_s_time"] = 0
+            # Reset mode-specific state
+            if result["current"] != "unsloth":
+                log_parser._unsloth_prev = None
+                log_parser._unsloth_was_active = False
+            if result["current"] != "ollama":
+                log_parser._ollama_cursor = ""
+        return {"success": True, **result}
+    except ValueError as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ─── Global shutdown flag + SSE connection tracking ─────────────────
