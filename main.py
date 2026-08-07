@@ -189,6 +189,10 @@ class CostProxy:
         self._getter = getter
     def __float__(self):
         return float(self._getter())
+    def __mul__(self, other):
+        return float(self._getter()) * other
+    def __rmul__(self, other):
+        return other * float(self._getter())
 COST_INPUT_PER_M = CostProxy(get_cost_input_per_m)
 COST_OUTPUT_PER_M = CostProxy(get_cost_output_per_m)
 
