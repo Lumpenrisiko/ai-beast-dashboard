@@ -395,6 +395,19 @@ body{
     </div>
     <div class="modal-hint">Port des llama-server (0 = automatisch erkennen)</div>
 
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+    <div style="font-size:.75rem;color:var(--m);margin-bottom:8px;font-weight:600;">Tokenpreise (EUR pro 1 Mio.)</div>
+
+    <div class="modal-row">
+      <span class="modal-label">Input:</span>
+      <input type="number" step="0.001" min="0" class="modal-input" id="costInputPerMInput" placeholder="0.325" style="width:140px">
+    </div>
+
+    <div class="modal-row">
+      <span class="modal-label">Output:</span>
+      <input type="number" step="0.001" min="0" class="modal-input" id="costOutputPerMInput" placeholder="1.95" style="width:140px">
+    </div>
+
     <div class="modal-actions">
       <button class="modal-btn secondary" id="settingsCancelBtn">Abbrechen</button>
       <button class="modal-btn primary" id="settingsSaveBtn">Speichern</button>
@@ -444,6 +457,8 @@ document.getElementById('settingsBtn').addEventListener('click', async () => {
       document.getElementById('lmStudioUrlInput').value = s.lm_studio_url || '';
       document.getElementById('ollamaUrlInput').value = s.ollama_url || '';
       document.getElementById('unslothPortInput').value = s.unsloth_metrics_port ?? 0;
+      document.getElementById('costInputPerMInput').value = s.cost_input_per_m ?? 0.325;
+      document.getElementById('costOutputPerMInput').value = s.cost_output_per_m ?? 1.95;
     }
   } catch(e) { console.error('Failed to load settings:', e); }
   settingsModal.style.display = 'flex';

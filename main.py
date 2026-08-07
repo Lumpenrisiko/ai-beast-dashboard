@@ -32,6 +32,8 @@ def _load_config():
         "lm_studio_url": os.getenv("LM_STUDIO_URL", "http://localhost:1234"),
         "ollama_url": os.getenv("OLLAMA_URL", "http://localhost:11434"),
         "unsloth_metrics_port": int(os.getenv("UNSLOTH_METRICS_PORT", "0")),  # 0 = auto-detect
+        "cost_input_per_m": float(os.getenv("COST_INPUT_PER_M", "0.325")),
+        "cost_output_per_m": float(os.getenv("COST_OUTPUT_PER_M", "1.95")),
     }
     try:
         with open(_CONFIG_FILE, "r") as f:
@@ -100,12 +102,34 @@ def set_unsloth_port(port: int):
     _save_config()
     return {"previous": old, "current": port}
 
+def get_cost_input_per_m():
+    return float(_DASHBOARD_CONFIG.get("cost_input_per_m", 0.325))
+
+def set_cost_input_per_m(cost: float):
+    cost = max(0, float(cost))
+    old = _DASHBOARD_CONFIG["cost_input_per_m"]
+    _DASHBOARD_CONFIG["cost_input_per_m"] = cost
+    _save_config()
+    return {"previous": old, "current": cost}
+
+def get_cost_output_per_m():
+    return float(_DASHBOARD_CONFIG.get("cost_output_per_m", 1.95))
+
+def set_cost_output_per_m(cost: float):
+    cost = max(0, float(cost))
+    old = _DASHBOARD_CONFIG["cost_output_per_m"]
+    _DASHBOARD_CONFIG["cost_output_per_m"] = cost
+    _save_config()
+    return {"previous": old, "current": cost}
+
 def get_all_settings():
     return {
         "mode": _DASHBOARD_CONFIG["mode"],
         "lm_studio_url": _DASHBOARD_CONFIG.get("lm_studio_url", "http://localhost:1234"),
         "ollama_url": _DASHBOARD_CONFIG.get("ollama_url", "http://localhost:11434"),
         "unsloth_metrics_port": int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0)),
+        "cost_input_per_m": float(_DASHBOARD_CONFIG.get("cost_input_per_m", 0.325)),
+        "cost_output_per_m": float(_DASHBOARD_CONFIG.get("cost_output_per_m", 1.95)),
     }
 
 # Backward compat aliases — always read current value from config dict
@@ -159,8 +183,14 @@ LACT_ENABLED = os.getenv("LACT_ENABLED", "true").lower() == "true"
 STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "2"))
 CHART_HISTORY = 60  # seconds of chart data to keep
 # Token pricing (EUR per 1M tokens)
-COST_INPUT_PER_M = float(os.getenv("COST_INPUT_PER_M", "0.325"))
-COST_OUTPUT_PER_M = float(os.getenv("COST_OUTPUT_PER_M", "1.95"))
+# Backward compat cost proxies (used throughout code)
+class CostProxy:
+    def __init__(self, getter):
+        self._getter = getter
+    def __float__(self):
+        return float(self._getter())
+COST_INPUT_PER_M = CostProxy(get_cost_input_per_m)
+COST_OUTPUT_PER_M = CostProxy(get_cost_output_per_m)
 
 
 class LlmLogParser:
@@ -1138,6 +1168,28 @@ async def api_set_unsloth_port(port: int):
     """Set Unsloth Studio llama-server port at runtime (0 = auto-detect)."""
     try:
         result = set_unsloth_port(port)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/set-cost-input")
+async def api_set_cost_input(cost: float):
+    """Set input token price (EUR per 1M tokens)."""
+    try:
+        result = set_cost_input_per_m(cost)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/set-cost-output")
+async def api_set_cost_output(cost: float):
+    """Set output token price (EUR per 1M tokens)."""
+    try:
+        result = set_cost_output_per_m(cost)
         return {"success": True, **result}
     except Exception as e:
         from fastapi import HTTPException
