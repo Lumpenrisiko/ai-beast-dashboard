@@ -1299,8 +1299,8 @@ async def _collect_stats():
             "session_output_tokens": session_output,
             "cost_total": round(cost_total, 4),
             "cost_session": round(cost_session, 4),
-            "cost_input_per_m": COST_INPUT_PER_M,
-            "cost_output_per_m": COST_OUTPUT_PER_M,
+            "cost_input_per_m": float(COST_INPUT_PER_M),
+            "cost_output_per_m": float(COST_OUTPUT_PER_M),
         },
     }
 
