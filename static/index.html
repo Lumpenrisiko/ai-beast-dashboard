@@ -421,6 +421,9 @@ const tc=t=>t<60?'var(--green)':t<80?'var(--yellow)':'var(--red)';
 const vtc=t=>t<65?'var(--green)':t<80?'var(--yellow)':'var(--red)';
 const fmtNum=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n);
 
+// Wait for DOM to be ready before attaching event listeners
+document.addEventListener('DOMContentLoaded', () => {
+
 // Reset session tokens button
 document.getElementById('lreset').addEventListener('click', async () => {
   try {
@@ -487,6 +490,8 @@ document.getElementById('settingsSaveBtn').addEventListener('click', async () =>
 
   settingsModal.style.display = 'none';
 });
+
+}); // End DOMContentLoaded
 
 function buildGPUs(n){
   const r=document.getElementById('gpuRow');r.innerHTML='';
