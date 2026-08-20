@@ -745,11 +745,31 @@ function update(d){
   document.getElementById('lcost_total').textContent='€'+(lm.cost_total||0).toFixed(4);
   document.getElementById('lcost_session').textContent='€'+(lm.cost_session||0).toFixed(4);
   
-  // Status: Idle / Processing / Generating (log-based)
+  // Status: Idle / Processing / Generating
   const statusEl=document.getElementById('lmstatus');
   if(!lm.running){
     statusEl.textContent='OFFLINE';
     statusEl.className='lm-plbl status-offline';
+  } else if(d.mode === 'Unsloth Studio'){
+    // Unsloth: Status aus echtem Echtzeit-Gauge (requests_processing),
+    // nicht aus has_timing (TTL) — sonst zeigt es "GENERATING"
+    // bis zu 15s nach dem Idle.
+    if(ls.is_active){
+      if(ls.phase === 'prompt'){
+        statusEl.textContent='⚡ PROCESSING PROMPT';
+        statusEl.className='lm-plbl status-processing';
+      } else if(ls.phase === 'generation'){
+        statusEl.textContent='⚡ GENERATING TOKENS';
+        statusEl.className='lm-plbl status-generating';
+      } else {
+        // is_active=true, aber noch keine Phase erkannt (Anfang)
+        statusEl.textContent='⚡ PROCESSING PROMPT';
+        statusEl.className='lm-plbl status-processing';
+      }
+    } else {
+      statusEl.textContent='● IDLE';
+      statusEl.className='lm-plbl status-idle';
+    }
   } else {
     const hasPrompting = ls.has_timing && pS!=null && pS>0 && progress<100;
     const hasGenerating = ls.has_timing && tokS!=null && tokS>0 && progress>=100;

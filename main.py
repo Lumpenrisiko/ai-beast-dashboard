@@ -217,6 +217,7 @@ class LlmLogParser:
         self._unsloth_prev = None
         self._unsloth_was_active = False
         self._unsloth_model_check = 0
+        self._unsloth_req_prompt_base = None
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -243,6 +244,9 @@ class LlmLogParser:
             # Queue tracking
             "queue_length": 0,
             "last_queue_update": 0,
+            # Unsloth real-time status (from requests_processing gauge)
+            "is_active": False,
+            "phase": "idle",
         }
         self._lock = asyncio.Lock()
         self._watch_task = None
@@ -473,6 +477,23 @@ class LlmLogParser:
             if prev is None or restarted:
                 self._unsloth_prev = snapshot
                 self._latest["last_update"] = now
+                if restarted:
+                    # Server neu gestartet — Counter zurücksetzen,
+                    # weil die Server-Counter bei 0 anfangen.
+                    self._latest["total_input_tokens"] = 0
+                    self._latest["total_output_tokens"] = 0
+                    self._latest["session_input_tokens"] = 0
+                    self._latest["session_output_tokens"] = 0
+                    self._latest["is_active"] = False
+                    self._latest["phase"] = "idle"
+                    self._unsloth_req_prompt_base = None
+                else:
+                    # Erster Scrape (Dashboard-Start): Gesamt-Counter auf den
+                    # aktuellen Server-Counter setzen, damit "Gesamt" die
+                    # Server-Lebensdauer widerspiegelt (nicht nur die Zeit
+                    # seit Dashboard-Start). Session bleibt bei 0.
+                    self._latest["total_input_tokens"] = int(snapshot["prompt"])
+                    self._latest["total_output_tokens"] = int(snapshot["gen"])
                 return
 
             dt_wall = max(now - prev["time"], 0.001)
@@ -493,6 +514,7 @@ class LlmLogParser:
                 self._latest["prompt_progress"] = 100.0
                 self._latest["total_input_tokens"] += int(delta_prompt)
                 self._latest["session_input_tokens"] += int(delta_prompt)
+                self._latest["phase"] = "prompt"
 
             if delta_gen > 0:
                 rate = self._token_rate(delta_gen, delta_gen_s, gauge_gen, dt_wall)
@@ -505,17 +527,39 @@ class LlmLogParser:
                 self._latest["prompt_progress"] = 100.0
                 self._latest["total_output_tokens"] += int(delta_gen)
                 self._latest["session_output_tokens"] += int(delta_gen)
+                self._latest["phase"] = "generation"
 
             n_tokens_max = metrics.get("llamacpp:n_tokens_max", 0)
             if n_tokens_max > 0:
                 self._latest["n_tokens_max"] = int(n_tokens_max)
 
             is_active = requests_processing > 0 or requests_deferred > 0
+            # Neue Anfrage gestartet (rising edge): beginnt mit Prompt-Verarbeitung.
+            # Prompt-Counter-Baseline merken, um Phase-Wechsel live zu erkennen.
+            if is_active and not self._unsloth_was_active:
+                # Baseline = Counterstand VOR der Anfrage (letztes Idle-Snapshot).
+                # Ist der Prompt-Counter beim ersten aktiven Poll schon gewachsen,
+                # ist der Prompt bereits fertig → direkt "generation".
+                self._unsloth_req_prompt_base = prev["prompt"]
+                self._latest["phase"] = "prompt"
+            self._latest["is_active"] = is_active
             if is_active:
+                # Prompt-Counter ist seit Request-Start gewachsen → Prompt fertig,
+                # es wird jetzt generiert (gen-Counter erst am Request-Ende).
+                if (
+                    self._latest.get("phase") == "prompt"
+                    and self._unsloth_req_prompt_base is not None
+                    and snapshot["prompt"] > self._unsloth_req_prompt_base
+                ):
+                    self._latest["phase"] = "generation"
                 self._latest["queue_length"] = int(requests_processing + requests_deferred)
                 self._latest["last_queue_update"] = now
             else:
                 self._latest["queue_length"] = 0
+                self._unsloth_req_prompt_base = None
+                # Idle: Phase zurücksetzen, damit Frontend "IDLE" zeigt.
+                # Die letzten Raten bleiben sichtbar (Frontend fade-out).
+                self._latest["phase"] = "idle"
 
             # Idle reset: clear progress/timing flags but keep the last rates visible.
             # The frontend will fade stale values and only show 0 when lm.running=false.
@@ -1010,7 +1054,7 @@ async def get_loaded_models() -> list:
     models = []
     try:
         if DASHBOARD_MODE == "ollama":
-            url = f"{OLLAMA_URL}/api/ps"
+            url = str(OLLAMA_URL)
         elif DASHBOARD_MODE == "unsloth":
             import subprocess as sp
             result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
@@ -1023,9 +1067,9 @@ async def get_loaded_models() -> list:
                         break
             if not port:
                 return []
-            url = f"http://127.0.0.1:{port}/v1/models"
+            url = f"http://127.0.0.1:{port}"
         else:
-            url = f"{LM_STUDIO_URL}/v1/models"
+            url = str(LM_STUDIO_URL)
         async with aiohttp.ClientSession() as session:
             # Ollama /api/ps shows models currently loaded in memory
             # LM Studio: no direct endpoint, infer from /v1/models + VRAM usage
@@ -1042,10 +1086,13 @@ async def get_loaded_models() -> list:
                     if DASHBOARD_MODE == "ollama":
                         for m in data.get("models", []):
                             models.append(m.get("name", m.get("model", "")))
-                    else:
-                        # LM Studio doesn't have a "loaded" endpoint
-                        # (loaded_models will be populated via log parser)
-                        pass
+                    elif DASHBOARD_MODE == "unsloth":
+                        # llama-server /v1/models: geladene Modelle (OpenAI-Format)
+                        for m in data.get("data", []):
+                            mid = m.get("id") or m.get("name", "")
+                            if mid:
+                                models.append(mid)
+                    # LM Studio: kein "loaded"-Endpoint (via Log-Parser)
     except Exception:
         pass
     return models
@@ -1055,7 +1102,22 @@ async def get_available_models() -> list:
     """Get list of all available models on disk."""
     models = []
     try:
-        url = OLLAMA_URL if DASHBOARD_MODE == "ollama" else LM_STUDIO_URL
+        if DASHBOARD_MODE == "unsloth":
+            import subprocess as sp
+            result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
+            port = None
+            for line in result.stdout.split("\n"):
+                if "llama-server" in line:
+                    m = re.search(r"--port\s+(\d+)", line)
+                    if m:
+                        port = int(m.group(1))
+                        break
+            if port:
+                url = f"http://127.0.0.1:{port}"
+            else:
+                return []
+        else:
+            url = OLLAMA_URL if DASHBOARD_MODE == "ollama" else LM_STUDIO_URL
         async with aiohttp.ClientSession() as session:
             if DASHBOARD_MODE == "ollama":
                 endpoint = f"{url}/api/tags"
@@ -1131,6 +1193,7 @@ async def api_set_mode(mode: str):
             if result["current"] != "unsloth":
                 log_parser._unsloth_prev = None
                 log_parser._unsloth_was_active = False
+                log_parser._unsloth_req_prompt_base = None
             if result["current"] != "ollama":
                 log_parser._ollama_cursor = ""
         return {"success": True, **result}
