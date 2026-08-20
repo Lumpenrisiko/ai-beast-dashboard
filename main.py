@@ -34,6 +34,7 @@ def _load_config():
         "unsloth_metrics_port": int(os.getenv("UNSLOTH_METRICS_PORT", "0")),  # 0 = auto-detect
         "cost_input_per_m": float(os.getenv("COST_INPUT_PER_M", "0.325")),
         "cost_output_per_m": float(os.getenv("COST_OUTPUT_PER_M", "1.95")),
+        "cost_cache_ratio": float(os.getenv("COST_CACHE_RATIO", "0.10")),
     }
     try:
         with open(_CONFIG_FILE, "r") as f:
@@ -122,6 +123,16 @@ def set_cost_output_per_m(cost: float):
     _save_config()
     return {"previous": old, "current": cost}
 
+def get_cost_cache_ratio():
+    return float(_DASHBOARD_CONFIG.get("cost_cache_ratio", 0.10))
+
+def set_cost_cache_ratio(ratio: float):
+    ratio = max(0.0, min(1.0, float(ratio)))
+    old = _DASHBOARD_CONFIG["cost_cache_ratio"]
+    _DASHBOARD_CONFIG["cost_cache_ratio"] = ratio
+    _save_config()
+    return {"previous": old, "current": ratio}
+
 def get_all_settings():
     return {
         "mode": _DASHBOARD_CONFIG["mode"],
@@ -130,6 +141,7 @@ def get_all_settings():
         "unsloth_metrics_port": int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0)),
         "cost_input_per_m": float(_DASHBOARD_CONFIG.get("cost_input_per_m", 0.325)),
         "cost_output_per_m": float(_DASHBOARD_CONFIG.get("cost_output_per_m", 1.95)),
+        "cost_cache_ratio": float(_DASHBOARD_CONFIG.get("cost_cache_ratio", 0.10)),
     }
 
 # Backward compat aliases — always read current value from config dict
@@ -195,6 +207,9 @@ class CostProxy:
         return other * float(self._getter())
 COST_INPUT_PER_M = CostProxy(get_cost_input_per_m)
 COST_OUTPUT_PER_M = CostProxy(get_cost_output_per_m)
+# Price for KV-cached input tokens as a fraction of the input price
+# (OpenRouter convention: cached prompts cost 10% of the input price).
+COST_CACHE_RATIO = CostProxy(get_cost_cache_ratio)
 
 
 class LlmLogParser:
@@ -236,10 +251,13 @@ class LlmLogParser:
             "tok_s_time": 0,
             "p_s_time": 0,
             # Cumulative token counters (persistent, never reset)
+            # total_input_tokens = ALL input tokens incl. KV-cached (OpenRouter-style)
             "total_input_tokens": 0,
+            "total_input_cached_tokens": 0,
             "total_output_tokens": 0,
             # Session token counters (resettable via /api/reset-session-tokens)
             "session_input_tokens": 0,
+            "session_input_cached_tokens": 0,
             "session_output_tokens": 0,
             # Queue tracking
             "queue_length": 0,
@@ -458,6 +476,7 @@ class LlmLogParser:
             # Cumulative counters: tokens and the time llama.cpp spent on them
             snapshot = {
                 "prompt": metrics.get("llamacpp:prompt_tokens_total", 0),
+                "prompt_cached": metrics.get("llamacpp:prompt_tokens_cached_total", 0),
                 "prompt_s": metrics.get("llamacpp:prompt_seconds_total", 0),
                 "gen": metrics.get("llamacpp:tokens_predicted_total", 0),
                 "gen_s": metrics.get("llamacpp:tokens_predicted_seconds_total", 0),
@@ -481,8 +500,10 @@ class LlmLogParser:
                     # Server neu gestartet — Counter zurücksetzen,
                     # weil die Server-Counter bei 0 anfangen.
                     self._latest["total_input_tokens"] = 0
+                    self._latest["total_input_cached_tokens"] = 0
                     self._latest["total_output_tokens"] = 0
                     self._latest["session_input_tokens"] = 0
+                    self._latest["session_input_cached_tokens"] = 0
                     self._latest["session_output_tokens"] = 0
                     self._latest["is_active"] = False
                     self._latest["phase"] = "idle"
@@ -492,28 +513,36 @@ class LlmLogParser:
                     # aktuellen Server-Counter setzen, damit "Gesamt" die
                     # Server-Lebensdauer widerspiegelt (nicht nur die Zeit
                     # seit Dashboard-Start). Session bleibt bei 0.
-                    self._latest["total_input_tokens"] = int(snapshot["prompt"])
+                    # OpenRouter-Style: "in" = alle Input-Tokens inkl. gecachter.
+                    self._latest["total_input_tokens"] = int(snapshot["prompt"] + snapshot["prompt_cached"])
+                    self._latest["total_input_cached_tokens"] = int(snapshot["prompt_cached"])
                     self._latest["total_output_tokens"] = int(snapshot["gen"])
                 return
 
             dt_wall = max(now - prev["time"], 0.001)
             delta_prompt = snapshot["prompt"] - prev["prompt"]
+            delta_prompt_cached = max(0, int(snapshot["prompt_cached"] - prev["prompt_cached"]))
             delta_gen = snapshot["gen"] - prev["gen"]
             delta_prompt_s = snapshot["prompt_s"] - prev["prompt_s"]
             delta_gen_s = snapshot["gen_s"] - prev["gen_s"]
 
-            if delta_prompt > 0:
-                rate = self._token_rate(delta_prompt, delta_prompt_s, gauge_prompt, dt_wall)
-                if rate > 0:
-                    self._latest["prompt_tokens_per_sec"] = rate
-                    self._latest["p_s_time"] = now
+            if delta_prompt > 0 or delta_prompt_cached > 0:
+                # Rate: only real (non-cached) computation counts for tok/s
+                if delta_prompt > 0:
+                    rate = self._token_rate(delta_prompt, delta_prompt_s, gauge_prompt, dt_wall)
+                    if rate > 0:
+                        self._latest["prompt_tokens_per_sec"] = rate
+                        self._latest["p_s_time"] = now
                 self._latest["prompt_tokens"] = int(delta_prompt)
                 self._latest["prompt_time_ms"] = delta_prompt_s * 1000.0
                 self._latest["has_timing"] = True
                 # The counter only moves once the prompt is fully processed.
                 self._latest["prompt_progress"] = 100.0
-                self._latest["total_input_tokens"] += int(delta_prompt)
-                self._latest["session_input_tokens"] += int(delta_prompt)
+                # OpenRouter-style: "in" = all input tokens incl. KV-cached
+                self._latest["total_input_tokens"] += int(delta_prompt) + delta_prompt_cached
+                self._latest["total_input_cached_tokens"] += delta_prompt_cached
+                self._latest["session_input_tokens"] += int(delta_prompt) + delta_prompt_cached
+                self._latest["session_input_cached_tokens"] += delta_prompt_cached
                 self._latest["phase"] = "prompt"
 
             if delta_gen > 0:
@@ -1172,6 +1201,7 @@ async def api_reset_session_tokens():
     """Reset only the session token counter. Total counter persists."""
     async with log_parser._lock:
         log_parser._latest["session_input_tokens"] = 0
+        log_parser._latest["session_input_cached_tokens"] = 0
         log_parser._latest["session_output_tokens"] = 0
     return {"success": True}
 
@@ -1263,6 +1293,17 @@ async def api_set_cost_output(cost: float):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/set-cost-cache-ratio")
+async def api_set_cost_cache_ratio(ratio: float):
+    """Set KV-cached input price as fraction of input price (OpenRouter: 0.10)."""
+    try:
+        result = set_cost_cache_ratio(ratio)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ─── Global shutdown flag + SSE connection tracking ─────────────────
 _shutdown_flag = asyncio.Event()
 
@@ -1335,11 +1376,24 @@ async def _collect_stats():
 
     # Token counts and costs from log parser
     total_input = lm_log.get("total_input_tokens", 0)
+    total_input_cached = lm_log.get("total_input_cached_tokens", 0)
     total_output = lm_log.get("total_output_tokens", 0)
     session_input = lm_log.get("session_input_tokens", 0)
+    session_input_cached = lm_log.get("session_input_cached_tokens", 0)
     session_output = lm_log.get("session_output_tokens", 0)
-    cost_total = (total_input * COST_INPUT_PER_M + total_output * COST_OUTPUT_PER_M) / 1_000_000
-    cost_session = (session_input * COST_INPUT_PER_M + session_output * COST_OUTPUT_PER_M) / 1_000_000
+    # OpenRouter-style pricing: all input tokens count, but KV-cached input
+    # tokens are billed at cost_cache_ratio (default 10%) of the input price.
+    cache_price = float(COST_INPUT_PER_M) * float(COST_CACHE_RATIO)
+    cost_total = (
+        (total_input - total_input_cached) * COST_INPUT_PER_M
+        + total_input_cached * cache_price
+        + total_output * COST_OUTPUT_PER_M
+    ) / 1_000_000
+    cost_session = (
+        (session_input - session_input_cached) * COST_INPUT_PER_M
+        + session_input_cached * cache_price
+        + session_output * COST_OUTPUT_PER_M
+    ) / 1_000_000
 
     return {
         "timestamp": datetime.now().isoformat(),
@@ -1357,13 +1411,16 @@ async def _collect_stats():
             "log_stats": lm_log,
             "queue_length": lm_log.get("queue_length", 0),
             "total_input_tokens": total_input,
+            "total_input_cached_tokens": total_input_cached,
             "total_output_tokens": total_output,
             "session_input_tokens": session_input,
+            "session_input_cached_tokens": session_input_cached,
             "session_output_tokens": session_output,
             "cost_total": round(cost_total, 4),
             "cost_session": round(cost_session, 4),
             "cost_input_per_m": float(COST_INPUT_PER_M),
             "cost_output_per_m": float(COST_OUTPUT_PER_M),
+            "cost_cache_ratio": float(COST_CACHE_RATIO),
         },
     }
 

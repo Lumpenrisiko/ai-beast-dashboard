@@ -219,6 +219,10 @@ body{
 .lm-cost-inline{
   color:var(--green);font-weight:600;font-size:.6rem;
 }
+.lm-cache-badge{
+  color:#a855f7;font-weight:600;font-size:.6rem;
+  background:rgba(168,85,247,.12);padding:0 4px;border-radius:3px;
+}
 .lm-reset{
   background:rgba(255,255,255,.1);border:none;color:var(--text-dim);
   cursor:pointer;padding:1px 5px;border-radius:3px;font-size:.6rem;
@@ -357,7 +361,7 @@ body{
       <div class="lm-tokens">
         <div class="lm-tc-item">
           <span class="lm-tc-val" id="ltc">0 / 0</span>
-          <span class="lm-tc-lbl">Gesamt (I/O) <span class="lm-cost-inline" id="lcost_total">€0.0000</span></span>
+          <span class="lm-tc-lbl">Gesamt (I/O) <span class="lm-cache-badge" id="lcached" title="Gecachte Input-Tokens (KV-Cache)">🧠 0 %</span> <span class="lm-cost-inline" id="lcost_total">€0.0000</span></span>
         </div>
         <div class="lm-tc-item">
           <span class="lm-tc-val" id="lsc">0 / 0</span>
@@ -407,6 +411,12 @@ body{
       <span class="modal-label">Output:</span>
       <input type="number" step="0.001" min="0" class="modal-input" id="costOutputPerMInput" placeholder="1.95" style="width:140px">
     </div>
+
+    <div class="modal-row">
+      <span class="modal-label">Cache-Faktor:</span>
+      <input type="number" step="0.01" min="0" max="1" class="modal-input" id="costCacheRatioInput" placeholder="0.10" style="width:140px">
+    </div>
+    <div class="modal-hint">Gecachte Input-Tokens (KV-Cache) werden mit diesem Anteil des Input-Preises abgerechnet (OpenRouter: 0.10 = 10 %)</div>
 
     <div class="modal-actions">
       <button class="modal-btn secondary" id="settingsCancelBtn">Abbrechen</button>
@@ -462,6 +472,7 @@ document.getElementById('settingsBtn').addEventListener('click', async () => {
       document.getElementById('unslothPortInput').value = s.unsloth_metrics_port ?? 0;
       document.getElementById('costInputPerMInput').value = s.cost_input_per_m ?? 0.325;
       document.getElementById('costOutputPerMInput').value = s.cost_output_per_m ?? 1.95;
+      document.getElementById('costCacheRatioInput').value = s.cost_cache_ratio ?? 0.10;
     }
   } catch(e) { console.error('Failed to load settings:', e); }
   settingsModal.style.display = 'flex';
@@ -480,11 +491,17 @@ document.getElementById('settingsSaveBtn').addEventListener('click', async () =>
   const lmUrl = document.getElementById('lmStudioUrlInput').value.trim();
   const ollamaUrl = document.getElementById('ollamaUrlInput').value.trim();
   const unslothPort = parseInt(document.getElementById('unslothPortInput').value) || 0;
+  const costIn = parseFloat(document.getElementById('costInputPerMInput').value);
+  const costOut = parseFloat(document.getElementById('costOutputPerMInput').value);
+  const cacheRatio = parseFloat(document.getElementById('costCacheRatioInput').value);
 
   try {
     if (lmUrl) await fetch('/api/set-lm-studio-url?url=' + encodeURIComponent(lmUrl), {method: 'POST'});
     if (ollamaUrl) await fetch('/api/set-ollama-url?url=' + encodeURIComponent(ollamaUrl), {method: 'POST'});
     await fetch('/api/set-unsloth-port?port=' + unslothPort, {method: 'POST'});
+    if (!isNaN(costIn) && costIn >= 0) await fetch('/api/set-cost-input?cost=' + costIn, {method: 'POST'});
+    if (!isNaN(costOut) && costOut >= 0) await fetch('/api/set-cost-output?cost=' + costOut, {method: 'POST'});
+    if (!isNaN(cacheRatio) && cacheRatio >= 0 && cacheRatio <= 1) await fetch('/api/set-cost-cache-ratio?ratio=' + cacheRatio, {method: 'POST'});
     console.log('Settings saved');
   } catch(e) { console.error('Failed to save settings:', e); }
 
@@ -740,6 +757,19 @@ function update(d){
   // Token counters (split input/output)
   document.getElementById('ltc').textContent=fmtNum(lm.total_input_tokens||0)+' / '+fmtNum(lm.total_output_tokens||0);
   document.getElementById('lsc').textContent=fmtNum(lm.session_input_tokens||0)+' / '+fmtNum(lm.session_output_tokens||0);
+  // KV-cache badge: share of input tokens served from cache (OpenRouter-style)
+  const cachedEl=document.getElementById('lcached');
+  if (cachedEl) {
+    const totIn=lm.total_input_tokens||0;
+    const cached=lm.total_input_cached_tokens||0;
+    if (totIn>0) {
+      const pct=Math.round(cached/totIn*100);
+      cachedEl.textContent='🧠 '+pct+' % · '+fmtNum(cached);
+      cachedEl.style.display='';
+    } else {
+      cachedEl.style.display='none';
+    }
+  }
   
   // Cost display
   document.getElementById('lcost_total').textContent='€'+(lm.cost_total||0).toFixed(4);
