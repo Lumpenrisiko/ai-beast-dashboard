@@ -268,6 +268,13 @@ class LlmLogParser:
         }
         self._lock = asyncio.Lock()
         self._watch_task = None
+        # Skip token counting during the initial log backfill (LM Studio reads
+        # the last 100 KB / Ollama the last 30 s on startup). Without this,
+        # persisted counters would be double-counted after a restart.
+        self._skip_counting = False
+        # Persistent token counters — survive dashboard restarts until manually reset
+        self._token_counts_file = os.path.expanduser("~/.ai-beast-dashboard/token_counts.json")
+        self._load_persisted_token_counts()
         # TTL in seconds - values expire after this.
         # Unsloth/llama.cpp only publishes its counters when a request phase
         # finishes, so a single scrape has to stay visible much longer than a
@@ -288,6 +295,54 @@ class LlmLogParser:
                 await self._watch_task
             except asyncio.CancelledError:
                 pass
+
+    # --- Persistent token counters (survive restarts until manual reset) ---
+
+    _TOKEN_COUNTER_KEYS = (
+        "total_input_tokens",
+        "total_input_cached_tokens",
+        "total_output_tokens",
+        "session_input_tokens",
+        "session_input_cached_tokens",
+        "session_output_tokens",
+    )
+
+    def _load_persisted_token_counts(self):
+        """Load token counters from disk (called in __init__)."""
+        try:
+            with open(self._token_counts_file, "r") as f:
+                saved = json.load(f)
+            for k in self._TOKEN_COUNTER_KEYS:
+                if k in saved:
+                    self._latest[k] = max(0, int(saved[k]))
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            pass
+
+    def _save_persisted_token_counts(self):
+        """Write token counters to disk. Caller must hold self._lock."""
+        try:
+            os.makedirs(os.path.dirname(self._token_counts_file), exist_ok=True)
+            data = {k: int(self._latest[k]) for k in self._TOKEN_COUNTER_KEYS}
+            tmp = self._token_counts_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._token_counts_file)
+        except Exception:
+            pass
+
+    def _reset_token_counters(self, scope: str):
+        """Reset counters in place. Caller must hold self._lock.
+
+        scope: 'session' resets only session counters,
+               'total' resets everything (total + session).
+        """
+        if scope == "session":
+            for k in ("session_input_tokens", "session_input_cached_tokens", "session_output_tokens"):
+                self._latest[k] = 0
+        else:
+            for k in self._TOKEN_COUNTER_KEYS:
+                self._latest[k] = 0
+        self._save_persisted_token_counts()
 
     def _get_latest_log(self) -> str:
         """Get the path to the latest log file for today (numeric sort)."""
@@ -337,8 +392,16 @@ class LlmLogParser:
 
         file_changed = (latest != self._current_file or mtime != self._last_mtime)
         if file_changed:
+            # Only the very first read after process start is a backfill of
+            # already-counted history. Later file changes (e.g. new day's log
+            # file) contain fresh, not-yet-counted lines and must be counted.
+            initial_backfill = self._current_file is None
             self._current_file = latest
             self._last_mtime = mtime
+            if initial_backfill:
+                # Don't count the last-100 KB backfill — those lines were
+                # already counted before the previous restart.
+                self._skip_counting = True
             try:
                 with open(latest, "r") as f:
                     seek_pos = max(0, fsize - 100000)  # Last 100KB
@@ -354,6 +417,9 @@ class LlmLogParser:
                     self._position = fsize
             except (FileNotFoundError, PermissionError):
                 pass
+            finally:
+                if initial_backfill:
+                    self._skip_counting = False
             return
 
         # Read new lines appended since last check
@@ -385,9 +451,18 @@ class LlmLogParser:
             output = stdout.decode()
             if not output:
                 return
-            for line in output.split("\n"):
-                if line:
-                    self._parse_line(line)
+            # First poll after process start covers the last 30 s of history —
+            # those lines were already counted before the previous restart.
+            initial_backfill = not self._ollama_cursor
+            if initial_backfill:
+                self._skip_counting = True
+            try:
+                for line in output.split("\n"):
+                    if line:
+                        self._parse_line(line)
+            finally:
+                if initial_backfill:
+                    self._skip_counting = False
             try:
                 cursor_proc = await asyncio.create_subprocess_exec(
                     "journalctl", "-u", "ollama.service", "--no-pager",
@@ -497,26 +572,13 @@ class LlmLogParser:
                 self._unsloth_prev = snapshot
                 self._latest["last_update"] = now
                 if restarted:
-                    # Server neu gestartet — Counter zurücksetzen,
-                    # weil die Server-Counter bei 0 anfangen.
-                    self._latest["total_input_tokens"] = 0
-                    self._latest["total_input_cached_tokens"] = 0
-                    self._latest["total_output_tokens"] = 0
-                    self._latest["session_input_tokens"] = 0
-                    self._latest["session_input_cached_tokens"] = 0
-                    self._latest["session_output_tokens"] = 0
+                    # Server neu gestartet: Counter-Baseline neu setzen, damit
+                    # die Deltas nicht negativ werden. Die persistenten Token-
+                    # Counter bleiben ERHALTEN (nur manueller Reset setzt sie).
+                    self._unsloth_was_active = False
                     self._latest["is_active"] = False
                     self._latest["phase"] = "idle"
                     self._unsloth_req_prompt_base = None
-                else:
-                    # Erster Scrape (Dashboard-Start): Gesamt-Counter auf den
-                    # aktuellen Server-Counter setzen, damit "Gesamt" die
-                    # Server-Lebensdauer widerspiegelt (nicht nur die Zeit
-                    # seit Dashboard-Start). Session bleibt bei 0.
-                    # OpenRouter-Style: "in" = alle Input-Tokens inkl. gecachter.
-                    self._latest["total_input_tokens"] = int(snapshot["prompt"] + snapshot["prompt_cached"])
-                    self._latest["total_input_cached_tokens"] = int(snapshot["prompt_cached"])
-                    self._latest["total_output_tokens"] = int(snapshot["gen"])
                 return
 
             dt_wall = max(now - prev["time"], 0.001)
@@ -544,6 +606,7 @@ class LlmLogParser:
                 self._latest["session_input_tokens"] += int(delta_prompt) + delta_prompt_cached
                 self._latest["session_input_cached_tokens"] += delta_prompt_cached
                 self._latest["phase"] = "prompt"
+                self._save_persisted_token_counts()
 
             if delta_gen > 0:
                 rate = self._token_rate(delta_gen, delta_gen_s, gauge_gen, dt_wall)
@@ -557,6 +620,7 @@ class LlmLogParser:
                 self._latest["total_output_tokens"] += int(delta_gen)
                 self._latest["session_output_tokens"] += int(delta_gen)
                 self._latest["phase"] = "generation"
+                self._save_persisted_token_counts()
 
             n_tokens_max = metrics.get("llamacpp:n_tokens_max", 0)
             if n_tokens_max > 0:
@@ -709,10 +773,14 @@ class LlmLogParser:
             self._latest["p_s_time"] = time.time()
             self._latest["has_timing"] = True
             self._latest["last_update"] = time.time()
-            # Track cumulative input tokens (both total and session)
-            n_tokens = int(m.group(2))
-            self._latest["total_input_tokens"] += n_tokens
-            self._latest["session_input_tokens"] += n_tokens
+            # Track cumulative input tokens (both total and session).
+            # Skipped during the initial log backfill — those lines were
+            # already counted before the last restart (persisted counters).
+            if not self._skip_counting:
+                n_tokens = int(m.group(2))
+                self._latest["total_input_tokens"] += n_tokens
+                self._latest["session_input_tokens"] += n_tokens
+                self._save_persisted_token_counts()
             return
 
         # eval time = 2209.21 ms / 181 tokens (12.21 ms per token, 81.93 tokens per second)
@@ -724,10 +792,13 @@ class LlmLogParser:
             self._latest["tok_s_time"] = time.time()
             self._latest["has_timing"] = True
             self._latest["last_update"] = time.time()
-            # Track cumulative output tokens (both total and session)
-            n_tokens = int(m.group(2))
-            self._latest["total_output_tokens"] += n_tokens
-            self._latest["session_output_tokens"] += n_tokens
+            # Track cumulative output tokens (both total and session),
+            # skipped during the initial log backfill (see input above).
+            if not self._skip_counting:
+                n_tokens = int(m.group(2))
+                self._latest["total_output_tokens"] += n_tokens
+                self._latest["session_output_tokens"] += n_tokens
+                self._save_persisted_token_counts()
             return
 
         # draft acceptance = 0.82738 (139 accepted / 168 generated)
@@ -1200,9 +1271,15 @@ async def api_stats():
 async def api_reset_session_tokens():
     """Reset only the session token counter. Total counter persists."""
     async with log_parser._lock:
-        log_parser._latest["session_input_tokens"] = 0
-        log_parser._latest["session_input_cached_tokens"] = 0
-        log_parser._latest["session_output_tokens"] = 0
+        log_parser._reset_token_counters("session")
+    return {"success": True}
+
+
+@app.post("/api/reset-total-tokens")
+async def api_reset_total_tokens():
+    """Reset both total and session token counters to zero (and persist)."""
+    async with log_parser._lock:
+        log_parser._reset_token_counters("total")
     return {"success": True}
 
 

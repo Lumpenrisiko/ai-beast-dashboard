@@ -361,11 +361,11 @@ body{
       <div class="lm-tokens">
         <div class="lm-tc-item">
           <span class="lm-tc-val" id="ltc">0 / 0</span>
-          <span class="lm-tc-lbl">Gesamt (I/O) <span class="lm-cache-badge" id="lcached" title="Gecachte Input-Tokens (KV-Cache)">🧠 0 %</span> <span class="lm-cost-inline" id="lcost_total">€0.0000</span></span>
+          <span class="lm-tc-lbl">Gesamt (I/O) <span class="lm-cache-badge" id="lcached" title="Gecachte Input-Tokens (KV-Cache)">🧠 0 %</span> <span class="lm-cost-inline" id="lcost_total">€0.0000</span> <button class="lm-reset" id="lresetTotal" title="Gesamt-Counter auf 0 setzen">↺ Gesamt</button></span>
         </div>
         <div class="lm-tc-item">
           <span class="lm-tc-val" id="lsc">0 / 0</span>
-          <span class="lm-tc-lbl">Session (I/O) <span class="lm-cost-inline" id="lcost_session">€0.0000</span> <button class="lm-reset" id="lreset" title="Reset">↻</button></span>
+          <span class="lm-tc-lbl">Session (I/O) <span class="lm-cost-inline" id="lcost_session">€0.0000</span> <button class="lm-reset" id="lreset" title="Session-Counter auf 0 setzen">↺ Session</button></span>
         </div>
       </div>
 
@@ -436,8 +436,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Reset session tokens button
 document.getElementById('lreset').addEventListener('click', async () => {
+  if(!confirm('Session-Counter auf 0 setzen?')) return;
   try {
     await fetch('/api/reset-session-tokens', {method: 'POST'});
+  } catch(e) { console.error('Reset failed:', e); }
+});
+
+// Reset total tokens button (total + session)
+document.getElementById('lresetTotal').addEventListener('click', async () => {
+  if(!confirm('Gesamt- UND Session-Counter auf 0 setzen?')) return;
+  try {
+    await fetch('/api/reset-total-tokens', {method: 'POST'});
   } catch(e) { console.error('Reset failed:', e); }
 });
 
