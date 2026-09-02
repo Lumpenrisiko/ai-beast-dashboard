@@ -2,6 +2,7 @@
 """AI Beast Dashboard — FastAPI Backend (Log-only, no proxy)"""
 
 import asyncio
+import glob
 import json
 import os
 import re
@@ -1065,10 +1066,58 @@ async def _get_lact_stats() -> dict:
     return result
 
 
+# CPU package power via Intel/AMD RAPL energy counter (µJ).
+# energy_uj is world-readable after the udev rule 99-rapl-power.rules.
+_RAPL_ENERGY_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
+_rapl_state: dict = {"energy": None, "time": None}
+
+
+def _read_cpu_power_w() -> float | None:
+    """CPU package power in watts from the RAPL energy counter delta."""
+    try:
+        with open(_RAPL_ENERGY_PATH) as f:
+            energy = int(f.read().strip())
+        now = time.monotonic()
+        last_e, last_t = _rapl_state["energy"], _rapl_state["time"]
+        _rapl_state["energy"] = energy
+        _rapl_state["time"] = now
+        if last_e is None or last_t is None:
+            return None
+        de = energy - last_e
+        dt = now - last_t
+        if de < 0 or dt <= 0:
+            # Counter wrapped/reset — skip this sample
+            return None
+        return round(de / dt / 1_000_000, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def _read_cpu_freq_mhz() -> float | None:
+    """Average current core frequency (MHz) from cpufreq sysfs.
+
+    psutil.cpu_freq() reports bogus values on some AMD systems, so read the
+    per-core scaling_cur_freq directly and average over all cores.
+    """
+    freqs = []
+    try:
+        for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
+            try:
+                with open(p) as f:
+                    freqs.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                continue
+    except Exception:
+        pass
+    if not freqs:
+        cpu_freq = psutil.cpu_freq()
+        return round(cpu_freq.current, 0) if cpu_freq else None
+    return round(sum(freqs) / len(freqs) / 1000.0, 0)
+
+
 async def get_cpu_stats() -> dict:
     """Get CPU stats."""
     cpu_percent = psutil.cpu_percent(interval=0.1)
-    cpu_freq = psutil.cpu_freq()
     cpu_count = psutil.cpu_count()
 
     temp = None
@@ -1088,7 +1137,8 @@ async def get_cpu_stats() -> dict:
 
     return {
         "percent": cpu_percent,
-        "freq_current": cpu_freq.current if cpu_freq else None,
+        "freq_current": _read_cpu_freq_mhz(),
+        "power_w": _read_cpu_power_w(),
         "temperature": temp,
         "cores": cpu_count,
     }

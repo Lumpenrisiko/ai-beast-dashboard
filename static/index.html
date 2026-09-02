@@ -87,7 +87,7 @@ body{
 
 /* Row 2: Charts - kompakter */
 .r-charts{
-  flex:0 0 140px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
+  flex:0 0 140px;display:grid;grid-template-columns:repeat(4,1fr);gap:8px;
   min-height:0;overflow:hidden;
 }
 
@@ -265,6 +265,7 @@ body{
 
   <!-- Row 2: Charts -->
   <div class="r-charts">
+    <div class="ch"><canvas id="cpuC"></canvas></div>
     <div class="ch"><canvas id="uC"></canvas></div>
     <div class="ch"><canvas id="tC"></canvas></div>
     <div class="ch"><canvas id="pC"></canvas></div>
@@ -277,7 +278,7 @@ body{
       <div style="flex:1">
         <div class="bl">CPU</div>
         <div class="bv" id="cv">--%</div>
-        <div class="bs" id="cs">-- cores · --°C</div>
+        <div class="bs" id="cs">-- cores · <span id="ctemp" style="font-size:.85rem;font-weight:700;color:var(--text)">--°C</span> · <span id="cfreq">-- MHz</span> · <span id="cpwr">-- W</span></div>
         <div class="bbar"><div class="bbf" id="cb" style="width:0%;background:var(--blue)"></div></div>
       </div>
     </div>
@@ -537,7 +538,7 @@ function buildGPUs(n){
   }
 }
 
-const MP=30;let uC,tC,pC;
+const MP=30;let cpuC,uC,tC,pC;
 function initCharts(n){
   const o=(title,max)=>({
     responsive:true,maintainAspectRatio:false,animation:{duration:200},
@@ -553,6 +554,7 @@ function initCharts(n){
   uC=new Chart(document.getElementById('uC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Auslastung %',100)});
   tC=new Chart(document.getElementById('tC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Temperatur °C',120)});
   pC=new Chart(document.getElementById('pC'),{type:'line',data:{labels:[],datasets:[]},options:o('GPU Power (W)',1500)});
+  cpuC=new Chart(document.getElementById('cpuC'),{type:'line',data:{labels:[],datasets:[{label:'CPU %',data:[],borderColor:'#22c55e',backgroundColor:'#22c55e18',borderWidth:2,pointRadius:0,tension:0.3,fill:true}]},options:o('CPU Auslastung %',100)});
   for(let i=0;i<n;i++){
     [uC,tC].forEach(ch=>ch.data.datasets.push({
       label:`GPU ${i}`,data:[],borderColor:COL[i%3],backgroundColor:COL[i%3]+'18',
@@ -631,6 +633,7 @@ function update(d){
   });
   
   // Charts
+  push(cpuC,[d.cpu.percent]);
   push(uC,d.gpus.map(g=>g.util_gpu));
   push(tC,d.gpus.map(g=>g.temperature));
   // Power chart: single total line = sum of all GPUs
@@ -645,7 +648,13 @@ function update(d){
   const cpu=d.cpu;
   document.getElementById('cv').textContent=`${cpu.percent}%`;
   document.getElementById('cb').style.width=`${cpu.percent}%`;
-  document.getElementById('cs').textContent=`${cpu.cores} cores · ${cpu.temperature}°C`;
+  // cores label stays, temp gets its own larger span + freq + power
+  document.getElementById('cs').childNodes[0].nodeValue=`${cpu.cores} cores · `;
+  const tEl=document.getElementById('ctemp');
+  if(cpu.temperature!=null){tEl.textContent=`${cpu.temperature.toFixed(1)}°C`;tEl.style.color=tc(cpu.temperature);}
+  else{tEl.textContent='--°C';}
+  document.getElementById('cfreq').textContent=cpu.freq_current?`${Math.round(cpu.freq_current)} MHz`:'-- MHz';
+  document.getElementById('cpwr').textContent=cpu.power_w!=null?`${cpu.power_w.toFixed(1)} W`:'-- W';
   
   const mem=d.memory;
   document.getElementById('rv').textContent=`${mem.percent}%`;
