@@ -150,6 +150,16 @@ body{
 .bs{font-size:.6rem;color:var(--mm)}
 .bbar{width:100%;height:2px;background:rgba(255,255,255,.06);border-radius:1px;overflow:hidden;margin-top:2px}
 .bbf{height:100%;border-radius:1px;transition:width .5s}
+/* CPU card: homogenes 2x2 Metrik-Grid */
+.cpu-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:2px 10px;margin-top:6px;
+}
+.cpu-m{display:flex;justify-content:space-between;align-items:baseline;min-width:0}
+.cpu-ml{font-size:.6rem;color:var(--mm);white-space:nowrap}
+.cpu-mv{
+  font-size:.72rem;font-weight:600;color:var(--text);
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 
 /* LM Studio card - größer, mehr Platz */
 .bc-lm{flex-direction:column;align-items:stretch;gap:8px;justify-content:flex-start;padding:12px 18px;flex:1;min-height:0;overflow:hidden}
@@ -275,11 +285,16 @@ body{
   <div class="r-bot">
     <div class="bc">
       <div class="bi c">🔲</div>
-      <div style="flex:1">
+      <div style="flex:1;min-width:0">
         <div class="bl">CPU</div>
         <div class="bv" id="cv">--%</div>
-        <div class="bs" id="cs">-- cores · <span id="ctemp" style="font-size:.85rem;font-weight:700;color:var(--text)">--°C</span> · <span id="cfreq">-- MHz</span> · <span id="cpwr">-- W</span></div>
         <div class="bbar"><div class="bbf" id="cb" style="width:0%;background:var(--blue)"></div></div>
+        <div class="cpu-grid">
+          <div class="cpu-m"><span class="cpu-ml">🌡 Temp</span><span class="cpu-mv" id="ctemp">--°C</span></div>
+          <div class="cpu-m"><span class="cpu-ml">⚡ Takt</span><span class="cpu-mv" id="cfreq">-- MHz</span></div>
+          <div class="cpu-m"><span class="cpu-ml">🔌 Power</span><span class="cpu-mv" id="cpwr">-- W</span></div>
+          <div class="cpu-m"><span class="cpu-ml">🧩 Kerne</span><span class="cpu-mv" id="cch">--</span></div>
+        </div>
       </div>
     </div>
     <div class="bc">
@@ -648,13 +663,12 @@ function update(d){
   const cpu=d.cpu;
   document.getElementById('cv').textContent=`${cpu.percent}%`;
   document.getElementById('cb').style.width=`${cpu.percent}%`;
-  // cores label stays, temp gets its own larger span + freq + power
-  document.getElementById('cs').childNodes[0].nodeValue=`${cpu.cores} cores · `;
   const tEl=document.getElementById('ctemp');
   if(cpu.temperature!=null){tEl.textContent=`${cpu.temperature.toFixed(1)}°C`;tEl.style.color=tc(cpu.temperature);}
-  else{tEl.textContent='--°C';}
+  else{tEl.textContent='--°C';tEl.style.color='var(--text)';}
   document.getElementById('cfreq').textContent=cpu.freq_current?`${Math.round(cpu.freq_current)} MHz`:'-- MHz';
   document.getElementById('cpwr').textContent=cpu.power_w!=null?`${cpu.power_w.toFixed(1)} W`:'-- W';
+  document.getElementById('cch').textContent=cpu.cores||'--';
   
   const mem=d.memory;
   document.getElementById('rv').textContent=`${mem.percent}%`;
