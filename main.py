@@ -33,6 +33,7 @@ def _load_config():
         "lm_studio_url": os.getenv("LM_STUDIO_URL", "http://localhost:1234"),
         "ollama_url": os.getenv("OLLAMA_URL", "http://localhost:11434"),
         "unsloth_metrics_port": int(os.getenv("UNSLOTH_METRICS_PORT", "0")),  # 0 = auto-detect
+        "llamacpp_port": int(os.getenv("LLAMACPP_PORT", "8888")),  # 0 = auto-detect
         "cost_input_per_m": float(os.getenv("COST_INPUT_PER_M", "0.325")),
         "cost_output_per_m": float(os.getenv("COST_OUTPUT_PER_M", "1.95")),
         "cost_cache_ratio": float(os.getenv("COST_CACHE_RATIO", "0.10")),
@@ -61,7 +62,7 @@ def get_dashboard_mode():
     return _DASHBOARD_CONFIG["mode"]
 
 def set_dashboard_mode(mode: str):
-    valid_modes = ("lmstudio", "ollama", "unsloth")
+    valid_modes = ("lmstudio", "ollama", "unsloth", "llamacpp")
     mode = mode.lower().strip()
     if mode not in valid_modes:
         raise ValueError(f"Invalid mode '{mode}'. Must be one of {valid_modes}")
@@ -96,6 +97,16 @@ def set_ollama_url(url: str):
 
 def get_unsloth_port():
     return int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0))
+
+def get_llamacpp_port():
+    return int(_DASHBOARD_CONFIG.get("llamacpp_port", 8888))
+
+def set_llamacpp_port(port: int):
+    port = max(0, min(65535, int(port)))
+    old = _DASHBOARD_CONFIG.get("llamacpp_port", 8888)
+    _DASHBOARD_CONFIG["llamacpp_port"] = port
+    _save_config()
+    return {"previous": old, "current": port}
 
 def set_unsloth_port(port: int):
     port = max(0, min(65535, int(port)))
@@ -140,6 +151,7 @@ def get_all_settings():
         "lm_studio_url": _DASHBOARD_CONFIG.get("lm_studio_url", "http://localhost:1234"),
         "ollama_url": _DASHBOARD_CONFIG.get("ollama_url", "http://localhost:11434"),
         "unsloth_metrics_port": int(_DASHBOARD_CONFIG.get("unsloth_metrics_port", 0)),
+        "llamacpp_port": int(_DASHBOARD_CONFIG.get("llamacpp_port", 8888)),
         "cost_input_per_m": float(_DASHBOARD_CONFIG.get("cost_input_per_m", 0.325)),
         "cost_output_per_m": float(_DASHBOARD_CONFIG.get("cost_output_per_m", 1.95)),
         "cost_cache_ratio": float(_DASHBOARD_CONFIG.get("cost_cache_ratio", 0.10)),
@@ -178,6 +190,7 @@ class PortProxy:
     def __eq__(self, other):
         return self._getter() == other
 UNSLOTH_METRICS_PORT = PortProxy(get_unsloth_port)
+LLAMACPP_PORT = PortProxy(get_llamacpp_port)
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
 # Auto-detect current month's log directory if not explicitly set
 if not LM_STUDIO_LOG_DIR:
@@ -234,6 +247,11 @@ class LlmLogParser:
         self._unsloth_was_active = False
         self._unsloth_model_check = 0
         self._unsloth_req_prompt_base = None
+        # llamacpp mode: state for the directly-started llama-server
+        self._llamacpp_prev = None
+        self._llamacpp_was_active = False
+        self._llamacpp_model_check = 0
+        self._llamacpp_req_prompt_base = None
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -280,7 +298,7 @@ class LlmLogParser:
         # Unsloth/llama.cpp only publishes its counters when a request phase
         # finishes, so a single scrape has to stay visible much longer than a
         # log line (which arrives continuously while the request runs).
-        self._ttl = 15 if get_dashboard_mode() == "unsloth" else 5
+        self._ttl = 15 if get_dashboard_mode() in ("unsloth", "llamacpp") else 5
 
     async def start_watching(self):
         """Start watching logs."""
@@ -372,6 +390,8 @@ class LlmLogParser:
                     await self._poll_ollama_logs()
                 elif DASHBOARD_MODE == "unsloth":
                     await self._poll_unsloth_metrics()
+                elif DASHBOARD_MODE == "llamacpp":
+                    await self._poll_llamacpp()
                 else:
                     await self._watch_lmstudio_logs()
             except asyncio.CancelledError:
@@ -480,6 +500,27 @@ class LlmLogParser:
                 pass
         except Exception:
             pass
+
+    @staticmethod
+    def _detect_llama_port_from_ps() -> int | None:
+        """Find llama-server --port from the process list."""
+        import subprocess as sp
+        try:
+            result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
+            for line in result.stdout.split("\n"):
+                if "llama-server" in line:
+                    m = re.search(r"--port\s+(\d+)", line)
+                    if m:
+                        return int(m.group(1))
+        except Exception:
+            pass
+        return None
+
+    def _get_llamacpp_port(self) -> int | None:
+        """Port of the directly-started llama-server (config wins, else auto-detect)."""
+        if LLAMACPP_PORT > 0:
+            return int(LLAMACPP_PORT)
+        return self._detect_llama_port_from_ps()
 
     async def _get_unsloth_metrics_url(self) -> str:
         """Auto-detect llama-server port from running process or use configured port."""
@@ -669,6 +710,221 @@ class LlmLogParser:
             self._unsloth_prev = snapshot
             self._unsloth_was_active = is_active
             self._latest["last_update"] = now
+        except Exception:
+            pass
+
+    # ─── llamacpp mode: directly-started llama-server (/metrics + /slots) ───
+
+    async def _poll_llamacpp(self):
+        """Scrape a directly-started llama-server via /metrics and /slots.
+
+        Provides live token/s, prompt/s, real prompt-processing progress (from
+        /slots n_prompt_tokens_processed), queue, phase and MTP speculative-
+        decoding statistics. The server must be started with --metrics.
+        """
+        port = self._get_llamacpp_port()
+        if not port:
+            self._latest["running"] = False
+            return
+        try:
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(
+                        f"http://127.0.0.1:{port}/metrics",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        text = await resp.text() if resp.status == 200 else ""
+                except Exception:
+                    text = ""
+                try:
+                    async with session.get(
+                        f"http://127.0.0.1:{port}/slots",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        slots = await resp.json() if resp.status == 200 else []
+                except Exception:
+                    slots = []
+
+            if not text:
+                return
+
+            metrics = {}
+            for line in text.split("\n"):
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    try:
+                        metrics[parts[0]] = float(parts[1])
+                    except ValueError:
+                        pass
+
+            now = time.time()
+            requests_processing = metrics.get("llamacpp:requests_processing", 0)
+            requests_deferred = metrics.get("llamacpp:requests_deferred", 0)
+
+            snapshot = {
+                "prompt": metrics.get("llamacpp:prompt_tokens_total", 0),
+                "prompt_cached": metrics.get("llamacpp:prompt_tokens_cached_total", 0),
+                "prompt_s": metrics.get("llamacpp:prompt_seconds_total", 0),
+                "gen": metrics.get("llamacpp:tokens_predicted_total", 0),
+                "gen_s": metrics.get("llamacpp:tokens_predicted_seconds_total", 0),
+                "draft": metrics.get("llamacpp:spec_decode_num_draft_tokens_total", 0),
+                "accepted": metrics.get("llamacpp:spec_decode_num_accepted_tokens_total", 0),
+                "time": now,
+            }
+            gauge_prompt = metrics.get("llamacpp:prompt_tokens_seconds", 0)
+            gauge_gen = metrics.get("llamacpp:predicted_tokens_seconds", 0)
+
+            prev = self._llamacpp_prev
+            restarted = prev is not None and (
+                snapshot["prompt"] < prev["prompt"] or snapshot["gen"] < prev["gen"]
+            )
+            if prev is None or restarted:
+                self._llamacpp_prev = snapshot
+                self._latest["last_update"] = now
+                if restarted:
+                    self._llamacpp_was_active = False
+                    self._llamacpp_req_prompt_base = None
+                    self._latest["is_active"] = False
+                    self._latest["phase"] = "idle"
+                    self._latest["prompt_progress"] = 0
+                return
+
+            dt_wall = max(now - prev["time"], 0.001)
+            d_prompt = snapshot["prompt"] - prev["prompt"]
+            d_prompt_cached = max(0, int(snapshot["prompt_cached"] - prev["prompt_cached"]))
+            d_gen = snapshot["gen"] - prev["gen"]
+            d_prompt_s = snapshot["prompt_s"] - prev["prompt_s"]
+            d_gen_s = snapshot["gen_s"] - prev["gen_s"]
+
+            if d_prompt > 0 or d_prompt_cached > 0:
+                if d_prompt > 0:
+                    rate = self._token_rate(d_prompt, d_prompt_s, gauge_prompt, dt_wall)
+                    if rate > 0:
+                        self._latest["prompt_tokens_per_sec"] = rate
+                        self._latest["p_s_time"] = now
+                    self._latest["prompt_tokens"] = int(d_prompt)
+                    self._latest["prompt_time_ms"] = d_prompt_s * 1000.0
+                self._latest["has_timing"] = True
+                # OpenRouter-style: "in" = all input tokens incl. KV-cached
+                self._latest["total_input_tokens"] += int(d_prompt) + d_prompt_cached
+                self._latest["total_input_cached_tokens"] += d_prompt_cached
+                self._latest["session_input_tokens"] += int(d_prompt) + d_prompt_cached
+                self._latest["session_input_cached_tokens"] += d_prompt_cached
+
+            if d_gen > 0:
+                rate = self._token_rate(d_gen, d_gen_s, gauge_gen, dt_wall)
+                if rate > 0:
+                    self._latest["tokens_per_sec"] = rate
+                    self._latest["tok_s_time"] = now
+                self._latest["eval_tokens"] = int(d_gen)
+                self._latest["eval_time_ms"] = d_gen_s * 1000.0
+                self._latest["has_timing"] = True
+                self._latest["total_output_tokens"] += int(d_gen)
+                self._latest["session_output_tokens"] += int(d_gen)
+
+            # ── MTP / speculative decoding statistics (lifetime totals) ──
+            draft_total = int(snapshot["draft"])
+            accepted_total = int(snapshot["accepted"])
+            self._latest["draft_generated"] = draft_total
+            self._latest["draft_accepted"] = accepted_total
+            self._latest["draft_acceptance"] = (
+                (accepted_total / draft_total) if draft_total > 0 else 0.0
+            )
+
+            n_tokens_max = metrics.get("llamacpp:n_tokens_max", 0)
+            if n_tokens_max > 0:
+                self._latest["n_tokens_max"] = int(n_tokens_max)
+
+            is_active = requests_processing > 0 or requests_deferred > 0
+
+            # ── Real prompt-processing progress from /slots ──
+            pp_progress = 0.0
+            slot_processing = False
+            if isinstance(slots, list):
+                for s in slots:
+                    if s.get("is_processing"):
+                        slot_processing = True
+                    total = s.get("n_prompt_tokens", 0) or 0
+                    if total > 0:
+                        processed = (s.get("n_prompt_tokens_processed", 0) or 0) + (
+                            s.get("n_prompt_tokens_cache", 0) or 0
+                        )
+                        pp_progress = max(pp_progress, min(100.0, processed / total * 100.0))
+
+            # Phase detection: rising edge marks the start of a prompt.
+            if is_active and not self._llamacpp_was_active:
+                self._llamacpp_req_prompt_base = prev["prompt"]
+                self._latest["phase"] = "prompt"
+                self._latest["prompt_progress"] = 0.0
+            self._latest["is_active"] = is_active
+            if is_active:
+                if self._latest.get("phase") is None:
+                    self._latest["phase"] = "prompt"
+                # Switch to generation once the prompt counter moved OR the
+                # slot progress reached 100 %.
+                prompt_done = (
+                    self._llamacpp_req_prompt_base is not None
+                    and snapshot["prompt"] > self._llamacpp_req_prompt_base
+                ) or pp_progress >= 100.0
+                if self._latest.get("phase") == "prompt" and prompt_done:
+                    self._latest["phase"] = "generation"
+                # Progress bar reflects PP; once generating it is pinned to 100.
+                if self._latest.get("phase") == "generation":
+                    self._latest["prompt_progress"] = 100.0
+                elif pp_progress > 0:
+                    self._latest["prompt_progress"] = pp_progress
+                self._latest["queue_length"] = int(requests_processing + requests_deferred)
+                self._latest["last_queue_update"] = now
+            else:
+                # If the slot is still busy but metrics gauge says idle (rare),
+                # trust the slot for the progress bar.
+                if slot_processing and pp_progress > 0:
+                    self._latest["prompt_progress"] = pp_progress
+                else:
+                    self._latest["prompt_progress"] = 0
+                self._latest["queue_length"] = 0
+                self._llamacpp_req_prompt_base = None
+                self._latest["phase"] = "idle"
+
+            if now - self._llamacpp_model_check > 30:
+                await self._fetch_llamacpp_model(port)
+                self._llamacpp_model_check = now
+
+            self._llamacpp_prev = snapshot
+            self._llamacpp_was_active = is_active
+            self._latest["last_update"] = now
+        except Exception:
+            pass
+
+    async def _fetch_llamacpp_model(self, port: int):
+        """Model alias/name from the llama-server /props + /v1/models."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                model = ""
+                try:
+                    async with session.get(
+                        f"http://127.0.0.1:{port}/props",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        if resp.status == 200:
+                            props = await resp.json()
+                            model = props.get("model_alias", "") or ""
+                except Exception:
+                    pass
+                if not model:
+                    async with session.get(
+                        f"http://127.0.0.1:{port}/v1/models",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            items = data.get("data") or data.get("models") or []
+                            if items:
+                                model = items[0].get("id") or items[0].get("name", "")
+                if model:
+                    self._latest["model"] = model
         except Exception:
             pass
 
@@ -1187,6 +1443,11 @@ async def check_llm_running() -> bool:
                 if not port:
                     return False
                 url = f"http://127.0.0.1:{port}/health"
+        elif DASHBOARD_MODE == "llamacpp":
+            port = log_parser._get_llamacpp_port()
+            if not port:
+                return False
+            url = f"http://127.0.0.1:{port}/health"
         else:
             url = f"{LM_STUDIO_URL}/v1/models"
         async with aiohttp.ClientSession() as session:
@@ -1205,16 +1466,12 @@ async def get_loaded_models() -> list:
     try:
         if DASHBOARD_MODE == "ollama":
             url = str(OLLAMA_URL)
-        elif DASHBOARD_MODE == "unsloth":
-            import subprocess as sp
-            result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
-            port = None
-            for line in result.stdout.split("\n"):
-                if "llama-server" in line:
-                    m = re.search(r"--port\s+(\d+)", line)
-                    if m:
-                        port = int(m.group(1))
-                        break
+        elif DASHBOARD_MODE in ("unsloth", "llamacpp"):
+            port = (
+                log_parser._get_llamacpp_port()
+                if DASHBOARD_MODE == "llamacpp"
+                else (int(UNSLOTH_METRICS_PORT) if UNSLOTH_METRICS_PORT > 0 else log_parser._detect_llama_port_from_ps())
+            )
             if not port:
                 return []
             url = f"http://127.0.0.1:{port}"
@@ -1236,9 +1493,9 @@ async def get_loaded_models() -> list:
                     if DASHBOARD_MODE == "ollama":
                         for m in data.get("models", []):
                             models.append(m.get("name", m.get("model", "")))
-                    elif DASHBOARD_MODE == "unsloth":
+                    elif DASHBOARD_MODE in ("unsloth", "llamacpp"):
                         # llama-server /v1/models: geladene Modelle (OpenAI-Format)
-                        for m in data.get("data", []):
+                        for m in (data.get("data") or data.get("models") or []):
                             mid = m.get("id") or m.get("name", "")
                             if mid:
                                 models.append(mid)
@@ -1252,20 +1509,15 @@ async def get_available_models() -> list:
     """Get list of all available models on disk."""
     models = []
     try:
-        if DASHBOARD_MODE == "unsloth":
-            import subprocess as sp
-            result = sp.run(["ps", "aux"], capture_output=True, text=True, timeout=3)
-            port = None
-            for line in result.stdout.split("\n"):
-                if "llama-server" in line:
-                    m = re.search(r"--port\s+(\d+)", line)
-                    if m:
-                        port = int(m.group(1))
-                        break
-            if port:
-                url = f"http://127.0.0.1:{port}"
-            else:
+        if DASHBOARD_MODE in ("unsloth", "llamacpp"):
+            port = (
+                log_parser._get_llamacpp_port()
+                if DASHBOARD_MODE == "llamacpp"
+                else (int(UNSLOTH_METRICS_PORT) if UNSLOTH_METRICS_PORT > 0 else log_parser._detect_llama_port_from_ps())
+            )
+            if not port:
                 return []
+            url = f"http://127.0.0.1:{port}"
         else:
             url = OLLAMA_URL if DASHBOARD_MODE == "ollama" else LM_STUDIO_URL
         async with aiohttp.ClientSession() as session:
@@ -1351,6 +1603,11 @@ async def api_set_mode(mode: str):
                 log_parser._unsloth_prev = None
                 log_parser._unsloth_was_active = False
                 log_parser._unsloth_req_prompt_base = None
+            if result["current"] != "llamacpp":
+                log_parser._llamacpp_prev = None
+                log_parser._llamacpp_was_active = False
+                log_parser._llamacpp_req_prompt_base = None
+                log_parser._llamacpp_model_check = 0
             if result["current"] != "ollama":
                 log_parser._ollama_cursor = ""
         return {"success": True, **result}
@@ -1392,6 +1649,17 @@ async def api_set_unsloth_port(port: int):
     """Set Unsloth Studio llama-server port at runtime (0 = auto-detect)."""
     try:
         result = set_unsloth_port(port)
+        return {"success": True, **result}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/set-llamacpp-port")
+async def api_set_llamacpp_port(port: int):
+    """Set llama.cpp server port at runtime (0 = auto-detect from process list)."""
+    try:
+        result = set_llamacpp_port(port)
         return {"success": True, **result}
     except Exception as e:
         from fastapi import HTTPException
@@ -1524,7 +1792,7 @@ async def _collect_stats():
 
     return {
         "timestamp": datetime.now().isoformat(),
-        "mode": "Unsloth Studio" if DASHBOARD_MODE == "unsloth" else ("Ollama" if DASHBOARD_MODE == "ollama" else "LM Studio"),
+        "mode": {"unsloth": "Unsloth Studio", "ollama": "Ollama", "llamacpp": "llama.cpp"}.get(str(DASHBOARD_MODE), "LM Studio"),
         "gpus": gpus,
         "cpu": cpu,
         "memory": mem,
