@@ -206,7 +206,7 @@ if not LM_STUDIO_LOG_DIR:
             if months:
                 LM_STUDIO_LOG_DIR = os.path.join(_default_base, months[0])
 LACT_ENABLED = os.getenv("LACT_ENABLED", "true").lower() == "true"
-STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "2"))
+STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", "1"))
 CHART_HISTORY = 60  # seconds of chart data to keep
 # Token pricing (EUR per 1M tokens)
 # Backward compat cost proxies (used throughout code)
@@ -252,6 +252,10 @@ class LlmLogParser:
         self._llamacpp_was_active = False
         self._llamacpp_model_check = 0
         self._llamacpp_req_prompt_base = None
+        # Live-rate tracking from /slots (n_decoded / n_prompt_tokens_processed
+        # grow every poll WHILE a request runs, unlike /metrics which only bumps
+        # at request end). Keys: t, decoded, processed, n_prompt
+        self._llamacpp_live = {"t": 0.0, "decoded": 0, "processed": 0, "n_prompt": 0}
         self._latest = {
             "prompt_progress": 0,
             "prompt_tokens_per_sec": 0,
@@ -842,6 +846,9 @@ class LlmLogParser:
             # ── Real prompt-processing progress from /slots ──
             pp_progress = 0.0
             slot_processing = False
+            live_decoded = 0
+            live_processed = 0
+            live_n_prompt = 0
             if isinstance(slots, list):
                 for s in slots:
                     if s.get("is_processing"):
@@ -852,6 +859,44 @@ class LlmLogParser:
                             s.get("n_prompt_tokens_cache", 0) or 0
                         )
                         pp_progress = max(pp_progress, min(100.0, processed / total * 100.0))
+                    live_n_prompt = max(live_n_prompt, total)
+                    nt = s.get("next_token")
+                    if isinstance(nt, list) and nt and isinstance(nt[0], dict):
+                        live_decoded += int(nt[0].get("n_decoded", 0) or 0)
+                    live_processed += int(s.get("n_prompt_tokens_processed", 0) or 0)
+
+            # ── Live token rates from /slots deltas ──
+            # /metrics counters only bump when a request FINISHES a phase, so
+            # during a long generation the dashboard rate looked frozen for
+            # many seconds. n_decoded / n_prompt_tokens_processed in /slots
+            # grow on every poll WHILE the slot works — divide their delta by
+            # the wall time between polls for a near real-time rate. At request
+            # end the authoritative /metrics average still overwrites them.
+            prev_live = self._llamacpp_live
+            if slot_processing and prev_live["t"] > 0 and (now - prev_live["t"]) > 0.15:
+                dt_live = now - prev_live["t"]
+                d_decoded = live_decoded - prev_live["decoded"]
+                if 0 < d_decoded < 10000:
+                    rate = d_decoded / dt_live
+                    if 0 < rate < 2000:
+                        self._latest["tokens_per_sec"] = rate
+                        self._latest["tok_s_time"] = now
+                        self._latest["has_timing"] = True
+                d_processed = live_processed - prev_live["processed"]
+                if 0 < d_processed < 100000:
+                    rate = d_processed / dt_live
+                    if 0 < rate < 20000:
+                        self._latest["prompt_tokens_per_sec"] = rate
+                        self._latest["p_s_time"] = now
+                        self._latest["has_timing"] = True
+            elif not slot_processing:
+                # Idle: remember baseline so the next request starts fresh
+                # (n_decoded restarts at 0 for every request).
+                pass
+            self._llamacpp_live = {
+                "t": now, "decoded": live_decoded,
+                "processed": live_processed, "n_prompt": live_n_prompt,
+            }
 
             # Phase detection: rising edge marks the start of a prompt.
             if is_active and not self._llamacpp_was_active:
