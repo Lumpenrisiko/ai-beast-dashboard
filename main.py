@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -191,6 +192,14 @@ class PortProxy:
         return self._getter() == other
 UNSLOTH_METRICS_PORT = PortProxy(get_unsloth_port)
 LLAMACPP_PORT = PortProxy(get_llamacpp_port)
+# Logdatei eines direkt gestarteten llama-server. Nur dort steht der echte
+# Prompt-Fortschritt; /slots liefert ihn nicht (n_prompt_tokens waechst
+# chargenweise mit n_prompt_tokens_processed, das Verhaeltnis haengt dauerhaft
+# bei ~99 %). Die Startskripte auf der Arbeitsflaeche schreiben hierhin.
+LLAMACPP_LOG = os.getenv(
+    "LLAMACPP_LOG", os.path.expanduser("~/llama-logs/llama-server.log")
+)
+
 LM_STUDIO_LOG_DIR = os.getenv("LM_STUDIO_LOG_DIR", "")
 # Auto-detect current month's log directory if not explicitly set
 if not LM_STUDIO_LOG_DIR:
@@ -250,6 +259,18 @@ class LlmLogParser:
         # llamacpp mode: state for the directly-started llama-server
         self._llamacpp_prev = None
         self._llamacpp_was_active = False
+        self._llamacpp_task_id = None
+        # Tailing der llama-server-Logdatei fuer den echten Prompt-Fortschritt
+        self._llamacpp_log_pos = 0
+        self._llamacpp_log_progress = None
+        self._llamacpp_log_progress_ts = 0.0
+        self._llamacpp_log_pp_rate = None
+        self._llamacpp_log_pp_rate_ts = 0.0
+        self._llamacpp_log_pp_tokens = None
+        self._llamacpp_log_tg_rate = None
+        self._llamacpp_log_tg_rate_ts = 0.0
+        self._llamacpp_log_draft = None      # (akzeptanz, accepted, generated, mean_len)
+        self._llamacpp_log_draft_ts = 0.0
         self._llamacpp_model_check = 0
         self._llamacpp_req_prompt_base = None
         # Live-rate tracking from /slots (n_decoded / n_prompt_tokens_processed
@@ -719,6 +740,134 @@ class LlmLogParser:
 
     # ─── llamacpp mode: directly-started llama-server (/metrics + /slots) ───
 
+    def _reset_llamacpp_log_state(self):
+        """Alle aus dem Log gelesenen Werte verwerfen.
+
+        Aufgerufen, wenn ein neuer llama-server-Prozess erkannt wird (die
+        /metrics-Zaehler laufen dann rueckwaerts). Auch die Leseposition wird
+        zurueckgesetzt, damit eine neu angelegte Logdatei von vorn gelesen wird.
+        """
+        self._llamacpp_log_pos = 0
+        self._llamacpp_log_progress = None
+        self._llamacpp_log_progress_ts = 0.0
+        self._llamacpp_log_pp_rate = None
+        self._llamacpp_log_pp_rate_ts = 0.0
+        self._llamacpp_log_pp_tokens = None
+        self._llamacpp_log_tg_rate = None
+        self._llamacpp_log_tg_rate_ts = 0.0
+        self._llamacpp_log_draft = None
+        self._llamacpp_log_draft_ts = 0.0
+        for k in ("draft_acceptance", "draft_accepted", "draft_generated",
+                  "draft_mean_len", "draft_time"):
+            self._latest[k] = 0
+        self._latest["draft_time"] = 0.0
+
+    def _read_llamacpp_log_progress(self):
+        """Echten Prompt-Fortschritt aus der llama-server-Logdatei nachlesen.
+
+        llama.cpp kennt die Gesamtlaenge des Prompts und schreibt sie heraus:
+          ... prompt processing, n_tokens = 2694, progress = 0.84, t = 10.16 s / ...
+
+        Ueber /slots ist dieser Wert nicht rekonstruierbar, weil dort
+        n_prompt_tokens chargenweise mitwaechst.
+
+        Gelesen wird nur der seit dem letzten Aufruf angewachsene Teil.
+        Schrumpft die Datei, wurde sie beim Serverstart neu angelegt -- dann
+        wird von vorn gelesen.
+        """
+        path = LLAMACPP_LOG
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size < self._llamacpp_log_pos:
+            self._llamacpp_log_pos = 0
+        if size == self._llamacpp_log_pos:
+            return
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                fh.seek(self._llamacpp_log_pos)
+                chunk = fh.read()
+                self._llamacpp_log_pos = fh.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            # Laufende Verarbeitung:
+            #   prompt processing, n_tokens = 1474, progress = 0.97,
+            #   t = 7.33 s / 201.08 tokens per second
+            m = re.search(r"prompt processing.*?progress\s*=\s*([\d.]+)", line)
+            if m:
+                self._llamacpp_log_progress = min(100.0, float(m.group(1)) * 100.0)
+                self._llamacpp_log_progress_ts = time.time()
+                m2 = re.search(r"n_tokens\s*=\s*(\d+)", line)
+                if m2:
+                    self._llamacpp_log_pp_tokens = int(m2.group(1))
+                m3 = re.search(r"/\s*([\d.]+)\s*tokens per second", line)
+                if m3:
+                    self._llamacpp_log_pp_rate = float(m3.group(1))
+                    self._llamacpp_log_pp_rate_ts = time.time()
+                continue
+
+            # Laufende Generierung:
+            #   n_gen = 500, tg = 26.08 t/s, tg_3s = 27.79 t/s
+            # Genommen wird tg_3s, das Mittel der letzten drei Sekunden: das
+            # Live-Feld soll den Momentanzustand zeigen. Fuer den geglaetteten
+            # Wert gibt es die Median-Kachel daneben, die dadurch echte
+            # Schwankungen mittelt statt kumulierter Mittelwerte.
+            m = re.search(r"n_gen\s*=\s*\d+,.*?tg_3s\s*=\s*([\d.]+)\s*t/s", line)
+            if m:
+                self._llamacpp_log_tg_rate = float(m.group(1))
+                self._llamacpp_log_tg_rate_ts = time.time()
+                continue
+
+            # Abschlusszeile der Generierung (ohne "prompt" davor):
+            #   eval time = 26514.85 ms / 700 tokens (37.93 ms per token,
+            #   26.36 tokens per second)
+            if "prompt eval time" not in line:
+                m = re.search(
+                    r"\beval time\s*=.*?/\s*\d+\s*tokens.*?"
+                    r"([\d.]+)\s*tokens per second",
+                    line,
+                )
+                if m:
+                    self._llamacpp_log_tg_rate = float(m.group(1))
+                    self._llamacpp_log_tg_rate_ts = time.time()
+                    continue
+
+            # MTP-Spekulation, je Anfrage am Ende:
+            #   draft acceptance = 0.49525 ( 417 accepted / 842 generated),
+            #   mean len = 2.48
+            # Die /metrics-Zaehler liefern hier nur Summen seit Serverstart,
+            # das Log dagegen den Wert der einzelnen Anfrage.
+            m = re.search(
+                r"draft acceptance\s*=\s*([\d.]+)\s*\(\s*(\d+)\s*accepted\s*/\s*"
+                r"(\d+)\s*generated\s*\).*?mean len\s*=\s*([\d.]+)",
+                line,
+            )
+            if m:
+                self._llamacpp_log_draft = (
+                    float(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4)),
+                )
+                self._llamacpp_log_draft_ts = time.time()
+                continue
+
+            # Abschlusszeile mit dem maessgeblichen Endwert:
+            #   prompt eval time = 10081.60 ms / 1990 tokens
+            #   ( 5.07 ms per token, 197.39 tokens per second)
+            m = re.search(
+                r"prompt eval time\s*=.*?/\s*(\d+)\s*tokens.*?"
+                r"([\d.]+)\s*tokens per second",
+                line,
+            )
+            if m:
+                self._llamacpp_log_pp_tokens = int(m.group(1))
+                self._llamacpp_log_pp_rate = float(m.group(2))
+                self._llamacpp_log_pp_rate_ts = time.time()
+                self._llamacpp_log_progress = 100.0
+                self._llamacpp_log_progress_ts = time.time()
+
     async def _poll_llamacpp(self):
         """Scrape a directly-started llama-server via /metrics and /slots.
 
@@ -789,10 +938,16 @@ class LlmLogParser:
                 self._latest["last_update"] = now
                 if restarted:
                     self._llamacpp_was_active = False
+                    self._llamacpp_task_id = None
                     self._llamacpp_req_prompt_base = None
                     self._latest["is_active"] = False
                     self._latest["phase"] = "idle"
                     self._latest["prompt_progress"] = 0
+                    # Neuer Serverprozess = neues Modell. Die aus dem Log
+                    # gelesenen Werte der letzten Anfrage gehoeren zum ALTEN
+                    # Modell und wuerden sonst weiter angezeigt, bis die erste
+                    # Anfrage des neuen Modells fertig ist.
+                    self._reset_llamacpp_log_state()
                 return
 
             dt_wall = max(now - prev["time"], 0.001)
@@ -828,12 +983,15 @@ class LlmLogParser:
                 self._latest["total_output_tokens"] += int(d_gen)
                 self._latest["session_output_tokens"] += int(d_gen)
 
-            # ── MTP / speculative decoding statistics (lifetime totals) ──
+            # ── MTP / speculative decoding: Summen seit Serverstart ──
+            # Bewusst in eigene *_total-Felder. Die gleichnamigen Felder ohne
+            # Suffix tragen den Wert der ZULETZT ABGESCHLOSSENEN Anfrage und
+            # werden weiter unten aus dem Log gesetzt.
             draft_total = int(snapshot["draft"])
             accepted_total = int(snapshot["accepted"])
-            self._latest["draft_generated"] = draft_total
-            self._latest["draft_accepted"] = accepted_total
-            self._latest["draft_acceptance"] = (
+            self._latest["draft_generated_total"] = draft_total
+            self._latest["draft_accepted_total"] = accepted_total
+            self._latest["draft_acceptance_total"] = (
                 (accepted_total / draft_total) if draft_total > 0 else 0.0
             )
 
@@ -843,16 +1001,37 @@ class LlmLogParser:
 
             is_active = requests_processing > 0 or requests_deferred > 0
 
+            # Echten Fortschritt aus der Logdatei nachziehen (falls vorhanden)
+            self._read_llamacpp_log_progress()
+
+            # MTP-Werte der zuletzt abgeschlossenen Anfrage.
+            # BEWUSST ausserhalb des is_active-Zweigs: die Draft-Zeile
+            # erscheint erst am ENDE einer Anfrage, zu diesem Zeitpunkt ist
+            # der Server oft schon wieder idle. Im aktiven Zweig wuerde der
+            # Wert dann nie ankommen.
+            # Kein Reset bei neuer Anfrage -- sonst staende das Feld waehrend
+            # jeder Generierung leer. Geleert wird nur beim Serverwechsel.
+            if self._llamacpp_log_draft is not None:
+                acc, accepted, generated, mean_len = self._llamacpp_log_draft
+                self._latest["draft_acceptance"] = acc
+                self._latest["draft_accepted"] = accepted
+                self._latest["draft_generated"] = generated
+                self._latest["draft_mean_len"] = mean_len
+                self._latest["draft_time"] = self._llamacpp_log_draft_ts
+
             # ── Real prompt-processing progress from /slots ──
             pp_progress = 0.0
             slot_processing = False
             live_decoded = 0
             live_processed = 0
             live_n_prompt = 0
+            slot_task_id = None
             if isinstance(slots, list):
                 for s in slots:
                     if s.get("is_processing"):
                         slot_processing = True
+                        if slot_task_id is None:
+                            slot_task_id = s.get("id_task")
                     total = s.get("n_prompt_tokens", 0) or 0
                     if total > 0:
                         processed = (s.get("n_prompt_tokens_processed", 0) or 0) + (
@@ -898,28 +1077,88 @@ class LlmLogParser:
                 "processed": live_processed, "n_prompt": live_n_prompt,
             }
 
-            # Phase detection: rising edge marks the start of a prompt.
-            if is_active and not self._llamacpp_was_active:
+            # Phase detection: neue Anfrage erkennen.
+            # Frueher nur ueber die steigende Flanke von is_active. Das
+            # scheitert bei Warteschlangen: liegen Anfragen hintereinander an,
+            # faellt is_active nie auf False, die Flanke bleibt aus und die
+            # Phase haengt auf "generation" der Vorgaengeranfrage fest --
+            # der Balken stand dauerhaft auf 100 %.
+            # id_task aus /slots wechselt dagegen bei jeder neuen Anfrage.
+            new_request = (
+                is_active and not self._llamacpp_was_active
+            ) or (
+                slot_task_id is not None and slot_task_id != self._llamacpp_task_id
+            )
+            if slot_task_id is not None:
+                self._llamacpp_task_id = slot_task_id
+            if new_request:
                 self._llamacpp_req_prompt_base = prev["prompt"]
                 self._latest["phase"] = "prompt"
                 self._latest["prompt_progress"] = 0.0
+                # Werte der Vorgaengeranfrage verwerfen
+                self._llamacpp_log_progress = None
+                self._llamacpp_log_progress_ts = 0.0
+                self._llamacpp_log_pp_rate = None
+                self._llamacpp_log_pp_rate_ts = 0.0
+                self._llamacpp_log_pp_tokens = None
+                self._llamacpp_log_tg_rate = None
+                self._llamacpp_log_tg_rate_ts = 0.0
             self._latest["is_active"] = is_active
             if is_active:
                 if self._latest.get("phase") is None:
                     self._latest["phase"] = "prompt"
                 # Switch to generation once the prompt counter moved OR the
                 # slot progress reached 100 %.
-                prompt_done = (
-                    self._llamacpp_req_prompt_base is not None
-                    and snapshot["prompt"] > self._llamacpp_req_prompt_base
-                ) or pp_progress >= 100.0
+                # n_decoded > 0 heisst: der Slot erzeugt bereits Tokens, der
+                # Prompt ist also durch. Das ist die verlaessliche Quelle.
+                # Der /metrics-Zaehler springt erst NACH Abschluss einer Phase
+                # und ist monoton -- einmal ueber der Baseline, meldete er
+                # "fertig" fuer jede weitere Anfrage.
+                # pp_progress taugt hier nicht als Kriterium: n_prompt_tokens
+                # waechst chargenweise mit, das Verhaeltnis liegt deshalb
+                # dauerhaft bei ~99 % (gemessen 98,7 % ueber die ganze
+                # Prompt-Verarbeitung eines 160k-Prompts).
+                prompt_done = live_decoded > 0
                 if self._latest.get("phase") == "prompt" and prompt_done:
                     self._latest["phase"] = "generation"
                 # Progress bar reflects PP; once generating it is pinned to 100.
                 if self._latest.get("phase") == "generation":
                     self._latest["prompt_progress"] = 100.0
+                elif (
+                    self._llamacpp_log_progress is not None
+                    and now - self._llamacpp_log_progress_ts <= 30
+                ):
+                    # Echter Wert aus dem Log hat Vorrang. pp_progress aus
+                    # /slots ist bei langen Prompts unbrauchbar (~99 % ab der
+                    # ersten Charge), taugt aber als Rueckfall, falls keine
+                    # Logdatei konfiguriert ist.
+                    self._latest["prompt_progress"] = self._llamacpp_log_progress
                 elif pp_progress > 0:
                     self._latest["prompt_progress"] = pp_progress
+
+                # Prompt-Rate ebenfalls aus dem Log bevorzugen. Die aus
+                # /slots-Deltas errechnete Rate ist unzuverlaessig, weil
+                # n_prompt_tokens_processed chargenweise springt: zwischen
+                # zwei Polls entweder 0 oder ein ganzer Batch. llama.cpp
+                # rechnet die Rate dagegen ueber die echte Laufzeit.
+                if (
+                    self._llamacpp_log_tg_rate is not None
+                    and now - self._llamacpp_log_tg_rate_ts <= 30
+                ):
+                    self._latest["tokens_per_sec"] = self._llamacpp_log_tg_rate
+                    self._latest["tok_s_time"] = self._llamacpp_log_tg_rate_ts
+                    self._latest["has_timing"] = True
+
+                if (
+                    self._llamacpp_log_pp_rate is not None
+                    and now - self._llamacpp_log_pp_rate_ts <= 30
+                ):
+                    self._latest["prompt_tokens_per_sec"] = self._llamacpp_log_pp_rate
+                    self._latest["p_s_time"] = self._llamacpp_log_pp_rate_ts
+                    self._latest["has_timing"] = True
+                    if self._llamacpp_log_pp_tokens is not None:
+                        self._latest["prompt_tokens"] = self._llamacpp_log_pp_tokens
+
                 self._latest["queue_length"] = int(requests_processing + requests_deferred)
                 self._latest["last_queue_update"] = now
             else:
@@ -1445,13 +1684,122 @@ async def get_cpu_stats() -> dict:
     }
 
 
+# ─── tok/s-Historie fuer den Medianwert ────────────────────────────
+# Der Momentanwert schwankt stark: bei identischer Konfiguration wurden 69 bis
+# 93 tok/s gemessen, und innerhalb einer Generierung steigt er typisch von ~63
+# auf ~87 an (Warmlaufen und schwankende MTP-Akzeptanz). Der Median ueber die
+# letzten Minuten ist deshalb deutlich aussagekraeftiger als der letzte
+# Messpunkt allein.
+_TOK_S_HISTORY: deque = deque(maxlen=600)
+_TOK_S_LAST_TS = 0.0
+_TOK_S_MODEL = None
+_TOK_S_WINDOW_S = 600.0  # Median ueber die letzten 10 Minuten
+
+
+def _update_tok_s_history(stats: dict) -> None:
+    """Neue tok/s-Messung aufnehmen und Median in stats eintragen.
+
+    Aufgenommen wird nur, wenn der Zeitstempel neuer ist als der zuletzt
+    gesehene -- der Parser liefert denselben Messwert sonst mehrfach und
+    wuerde den Median verzerren.
+
+    Bei einem Modellwechsel wird die Historie verworfen, damit sich Werte
+    verschiedener Modelle nicht vermischen (GLM-5.3 Q2 liegt bei ~4 tok/s,
+    Qwen Q4 bei ~85 -- ein gemeinsamer Median waere sinnlos).
+    """
+    global _TOK_S_LAST_TS, _TOK_S_MODEL
+
+    model = stats.get("model")
+    if model and model != _TOK_S_MODEL:
+        _TOK_S_MODEL = model
+        _TOK_S_HISTORY.clear()
+        _TOK_S_LAST_TS = 0.0
+
+    ts = float(stats.get("tok_s_time") or 0)
+    rate = float(stats.get("tokens_per_sec") or 0)
+    if rate > 0 and ts > _TOK_S_LAST_TS:
+        _TOK_S_LAST_TS = ts
+        _TOK_S_HISTORY.append((ts, rate))
+
+    cutoff = time.time() - _TOK_S_WINDOW_S
+    values = sorted(r for t, r in _TOK_S_HISTORY if t >= cutoff)
+    if values:
+        n = len(values)
+        median = values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
+        stats["tokens_per_sec_median"] = round(median, 1)
+        stats["tokens_per_sec_samples"] = n
+    else:
+        stats["tokens_per_sec_median"] = None
+        stats["tokens_per_sec_samples"] = 0
+
+
+# Prozesse, deren dateigestuetzter Speicher als "Modell im RAM" zaehlt
+_LLM_PROC_PATTERNS = ("llama-server", "llama-cli", "ollama", "lm-studio", "LM Studio")
+
+# Unterhalb dieser Groesse ist RssFile nur Programmcode und Bibliotheken,
+# kein Modell. 512 MiB liegt deutlich ueber dem, was die Binaries belegen.
+_LLM_MIN_FILE_RSS = 512 * 1024 * 1024
+
+
+def _llm_model_ram() -> tuple[int, list]:
+    """Dateigestuetzter Speicher der LLM-Serverprozesse in Bytes.
+
+    llama.cpp laedt die Gewichte nicht in eigenen Speicher, sondern bildet die
+    GGUF-Shards per mmap ab. Solche Seiten sind dateigestuetzt und zaehlen im
+    Kernel als Seitencache, nicht als "used" -- psutil.virtual_memory().used
+    blendet sie deshalb komplett aus. Ein 158-GiB-Modell erscheint dort gar
+    nicht, obwohl es den Speicher belegt.
+
+    Massgeblich ist stattdessen RssFile aus /proc/<pid>/status: der Anteil des
+    Prozesses, der dateigestuetzt und aktuell resident ist.
+    """
+    total = 0
+    procs = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            name = proc.info.get("name") or ""
+            cmd = " ".join(proc.info.get("cmdline") or ())
+            if not any(p in name or p in cmd for p in _LLM_PROC_PATTERNS):
+                continue
+            with open(f"/proc/{proc.info['pid']}/status") as fh:
+                for line in fh:
+                    if line.startswith("RssFile:"):
+                        nbytes = int(line.split()[1]) * 1024
+                        if nbytes >= _LLM_MIN_FILE_RSS:
+                            total += nbytes
+                            procs.append({
+                                "pid": proc.info["pid"],
+                                "name": name,
+                                "gb": round(nbytes / (1024**3), 1),
+                            })
+                        break
+        except (OSError, ValueError, psutil.Error):
+            continue
+    return total, procs
+
+
 async def get_memory_stats() -> dict:
-    """Get RAM stats."""
+    """Get RAM stats.
+
+    Neben dem klassischen "used" von psutil wird der per mmap belegte
+    Modellspeicher separat ausgewiesen, siehe _llm_model_ram().
+    """
     mem = psutil.virtual_memory()
+    model_bytes, model_procs = _llm_model_ram()
+
+    # Modellseiten liegen im Seitencache und sind in mem.used NICHT enthalten,
+    # duerfen also addiert werden, ohne doppelt zu zaehlen.
+    used_total = min(mem.used + model_bytes, mem.total)
+
     return {
         "total_gb": round(mem.total / (1024**3), 1),
         "used_gb": round(mem.used / (1024**3), 1),
         "percent": mem.percent,
+        # Neu: Modell im RAM
+        "model_gb": round(model_bytes / (1024**3), 1),
+        "model_procs": model_procs,
+        "used_total_gb": round(used_total / (1024**3), 1),
+        "percent_total": round(100 * used_total / mem.total, 1) if mem.total else 0.0,
     }
 
 
@@ -1810,6 +2158,10 @@ async def _collect_stats():
     # Fallback: use loaded model name if log parser didn't find one
     if not lm_log.get("model") and loaded_models:
         lm_log["model"] = loaded_models[0]
+
+    # tok/s-Median fortschreiben (nach dem Modell-Fallback, damit der
+    # Modellwechsel zuverlaessig erkannt wird)
+    _update_tok_s_history(lm_log)
 
     # Calculate total power
     total_power = sum(g.get("power_draw", 0) for g in gpus if isinstance(g, dict))

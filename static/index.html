@@ -198,6 +198,10 @@ body{
   padding:8px 12px;
 }
 .lm-dv{font-size:.9rem;font-weight:600;font-variant-numeric:tabular-nums}
+/* Kumulative Werte bewusst gedaempft: sie altern nicht und sollen die
+   Live-Werte der letzten Anfrage optisch nicht ueberstrahlen. */
+.lm-dtot{color:var(--mm);font-weight:500}
+.lm-dsep{color:var(--border);font-size:.9rem;user-select:none}
 .lm-dl{font-size:.6rem;color:var(--mm);text-transform:uppercase}
 
 /* Model Tags */
@@ -304,7 +308,7 @@ body{
         <div class="bl">RAM</div>
         <div class="bv" id="rv">--%</div>
         <div class="bs" id="rs">-- / -- GiB</div>
-        <div class="bbar"><div class="bbf" id="rb" style="width:0%;background:var(--purple)"></div></div>
+        <div class="bbar" style="display:flex"><div class="bbf" id="rb" style="width:0%;background:var(--purple)"></div><div class="bbf" id="rbm" style="width:0%;background:var(--blue)"></div></div>
       </div>
     </div>
     <div class="bc">
@@ -342,6 +346,10 @@ body{
           <span class="lm-ml">Token/sek</span>
         </div>
         <div class="lm-metric">
+          <span class="lm-mv" id="ltm" title="Median der letzten 10 Minuten">--</span>
+          <span class="lm-ml">Median T/s</span>
+        </div>
+        <div class="lm-metric">
           <span class="lm-mv" id="lp">--</span>
           <span class="lm-ml">PP/sek</span>
         </div>
@@ -376,6 +384,10 @@ body{
         <span><span class="lm-dv" id="lda">--</span> <span class="lm-dl">%</span></span>
         <span><span class="lm-dv" id="ldr">--</span> <span class="lm-dl">akz</span></span>
         <span><span class="lm-dv" id="ldr2">--</span> <span class="lm-dl">gen</span></span>
+        <span class="lm-dsep" title="links: letzte Anfrage  |  rechts: Summe seit Serverstart">|</span>
+        <span><span class="lm-dv lm-dtot" id="ldat">--</span> <span class="lm-dl">Σ %</span></span>
+        <span><span class="lm-dv lm-dtot" id="ldrt">--</span> <span class="lm-dl">Σ akz</span></span>
+        <span><span class="lm-dv lm-dtot" id="ldr2t">--</span> <span class="lm-dl">Σ gen</span></span>
       </div>
 
       <!-- Token Counters + Costs -->
@@ -685,9 +697,19 @@ function update(d){
   document.getElementById('cch').textContent=cpu.cores||'--';
   
   const mem=d.memory;
-  document.getElementById('rv').textContent=`${mem.percent}%`;
+  // Modellgewichte liegen per mmap im Seitencache und fehlen in mem.percent.
+  // percent_total enthaelt sie, das lila Segment zeigt weiterhin nur "used".
+  const modelGb=mem.model_gb||0;
+  const pctTotal=(mem.percent_total!=null)?mem.percent_total:mem.percent;
+  document.getElementById('rv').textContent=`${pctTotal}%`;
   document.getElementById('rb').style.width=`${mem.percent}%`;
-  document.getElementById('rs').textContent=`${mem.used_gb} / ${mem.total_gb} GiB`;
+  document.getElementById('rbm').style.width=`${Math.max(0,pctTotal-mem.percent)}%`;
+  document.getElementById('rs').textContent=modelGb>0
+    ?`${mem.used_gb} + ${modelGb} LLM / ${mem.total_gb} GiB`
+    :`${mem.used_gb} / ${mem.total_gb} GiB`;
+  document.getElementById('rs').title=modelGb>0
+    ?`System ${mem.used_gb} GiB, Modelle im RAM ${modelGb} GiB (mmap, zaehlt als Seitencache)`
+    :'';
   
   const disk=d.disk;
   document.getElementById('dv').textContent=`${disk.percent}%`;
@@ -745,6 +767,21 @@ function update(d){
     ltEl.style.color='rgba(255,255,255,0.35)';
   }
 
+  // Median der letzten 10 Minuten. Faded ueber denselben Zeitstempel wie der
+  // Live-Wert, damit beide gemeinsam altern.
+  const ltmEl=document.getElementById('ltm');
+  const tokMed=ls.tokens_per_sec_median;
+  const tokMedN=ls.tokens_per_sec_samples||0;
+  if(lm.running&&tokMed!=null&&tokMed>0){
+    ltmEl.textContent=tokMed.toFixed(1);
+    ltmEl.style.color=`rgba(255,255,255,${fadeAge(ls.tok_s_time,nowTs,fadeSec).toFixed(2)})`;
+    ltmEl.title=`Median aus ${tokMedN} Messwerten der letzten 10 Minuten`;
+  }else{
+    ltmEl.textContent=lm.running?'--':'0';
+    ltmEl.style.color='rgba(255,255,255,0.35)';
+    ltmEl.title='Noch keine Messwerte';
+  }
+
   if(lm.running){
     if(pS!=null&&pS>0){
       lpEl.textContent=pS.toFixed(1);
@@ -794,6 +831,36 @@ function update(d){
   document.getElementById('lda').textContent=draftAccNum;
   document.getElementById('ldr').textContent=(ls.draft_accepted||0)>0?ls.draft_accepted:'--';
   document.getElementById('ldr2').textContent=(draftGen||0)>0?draftGen:'--';
+  // Summen seit Serverstart (aus /metrics). Kein Fade: sie sind per Definition
+  // immer aktuell und altern nicht.
+  {
+    const at=ls.draft_acceptance_total, rt=ls.draft_accepted_total, gt=ls.draft_generated_total;
+    document.getElementById('ldat').textContent=(at&&at>0)?(at*100).toFixed(1):'--';
+    document.getElementById('ldrt').textContent=(rt||0)>0?rt:'--';
+    document.getElementById('ldr2t').textContent=(gt||0)>0?gt:'--';
+  }
+  // Fade wie bei den uebrigen Werten: weiss = frisch, grau = aelter.
+  // Laengeres Fenster als die 12 s der Raten, weil MTP-Werte nur EINMAL pro
+  // Anfrage entstehen (am Ende) -- mit 12 s waere das Feld praktisch immer grau.
+  {
+    const fadeSecDraft=90;
+    const alpha=(draftAccVal&&draftAccVal>0)
+      ? fadeAge(ls.draft_time,nowTs,fadeSecDraft).toFixed(2)
+      : '0.35';
+    ['lda','ldr','ldr2'].forEach(id=>{
+      const e=document.getElementById(id);
+      if(e) e.style.color=`rgba(255,255,255,${alpha})`;
+    });
+  }
+  // Mittlere Draft-Laenge als Tooltip; Werte stammen aus der letzten
+  // abgeschlossenen Anfrage, nicht kumuliert seit Serverstart.
+  {
+    const ml=ls.draft_mean_len;
+    const tip=(ml!=null&&ml>0)
+      ? `Letzte Anfrage: ${ls.draft_accepted} von ${draftGen} Draft-Tokens akzeptiert, mittlere Laenge ${ml.toFixed(2)}`
+      : 'Noch keine abgeschlossene Anfrage mit MTP';
+    ['lda','ldr','ldr2'].forEach(id=>{const e=document.getElementById(id); if(e&&e.parentElement) e.parentElement.title=tip;});
+  }
 
   // Hide MTP Draft row where no draft stats are available
   // (llama.cpp /metrics and LM Studio logs provide spec_decode counters)
