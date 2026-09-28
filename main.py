@@ -273,6 +273,12 @@ class LlmLogParser:
         self._llamacpp_log_draft_ts = 0.0
         self._llamacpp_model_check = 0
         self._llamacpp_req_prompt_base = None
+        # Freetoken (anderer Server auf demselben Port, ohne /metrics und /slots).
+        # Erkannt am 404 von /metrics; dann liefert /v1/stats die Werte.
+        self._backend_kind = "llamacpp"      # "llamacpp" | "freetoken"
+        self._backend_recheck = 0.0
+        self._ft_prev = None                  # letzter /v1/stats-Snapshot
+        self._ft_page_size = 0                # echte KV-Page-Size aus /v1/cache/status
         # Live-rate tracking from /slots (n_decoded / n_prompt_tokens_processed
         # grow every poll WHILE a request runs, unlike /metrics which only bumps
         # at request end). Keys: t, decoded, processed, n_prompt
@@ -879,6 +885,12 @@ class LlmLogParser:
         if not port:
             self._latest["running"] = False
             return
+        # Ist Freetoken bekannt, /metrics und /slots gar nicht erst anfragen --
+        # jede Anfrage erzeugt dort eine 404-Zeile im Log (alle 0,3 s).
+        # Alle 30 s wird neu geprueft, falls wieder llama-server laeuft.
+        if self._backend_kind == "freetoken" and time.time() < self._backend_recheck:
+            await self._poll_freetoken(port)
+            return
         try:
             async with aiohttp.ClientSession() as session:
                 try:
@@ -899,7 +911,14 @@ class LlmLogParser:
                     slots = []
 
             if not text:
+                # Kein llama-server -- vielleicht Freetoken auf demselben Port
+                await self._poll_freetoken(port)
                 return
+            if self._backend_kind != "llamacpp":
+                # Wechsel Freetoken -> llama-server: Zustand neu aufsetzen
+                self._backend_kind = "llamacpp"
+                self._llamacpp_prev = None
+                self._llamacpp_model_check = 0
 
             metrics = {}
             for line in text.split("\n"):
@@ -1181,6 +1200,132 @@ class LlmLogParser:
             self._latest["last_update"] = now
         except Exception:
             pass
+
+    async def _poll_freetoken(self, port: int) -> bool:
+        """Freetoken-Server ueber /v1/stats abfragen.
+
+        Freetoken hat weder /metrics noch /slots. /v1/stats liefert:
+          throughput.decode_tps / prefill_tps -- rollierendes Fenster, live
+          requests.active / completed, prompt_tokens_total, completion_tokens_total
+          kv.used_pages -- Kontextfuellung (Page-Size NICHT aus /v1/stats nehmen,
+                          dort steht 1; die echte steht in /v1/cache/status)
+        Nicht verfuegbar: Gesamtlaenge des laufenden Prompts (-> kein
+        Fortschrittsbalken), MTP (Freetoken nutzt keine spekulative Dekodierung).
+        Liefert False, wenn unter dem Port kein Freetoken antwortet.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://127.0.0.1:{port}/v1/stats",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status != 200:
+                        return False
+                    st = await resp.json()
+                if not isinstance(st, dict) or "throughput" not in st:
+                    return False
+                inst = st.get("instance_id")
+                prev = self._ft_prev
+                new_instance = (
+                    self._backend_kind != "freetoken"
+                    or prev is None
+                    or prev.get("instance_id") != inst
+                )
+                if new_instance or not self._ft_page_size:
+                    try:
+                        async with session.get(
+                            f"http://127.0.0.1:{port}/v1/cache/status",
+                            timeout=aiohttp.ClientTimeout(total=3),
+                        ) as resp:
+                            if resp.status == 200:
+                                geo = (await resp.json()).get("geometry", {}) or {}
+                                self._ft_page_size = int(geo.get("page_size", 0) or 0)
+                    except Exception:
+                        pass
+        except Exception:
+            return False
+
+        now = time.time()
+        self._backend_kind = "freetoken"
+        self._backend_recheck = now + 30
+        req = st.get("requests", {}) or {}
+        thr = st.get("throughput", {}) or {}
+        model = st.get("model", {}) or {}
+        snap = {
+            "instance_id": inst,
+            "prompt": int(req.get("prompt_tokens_total", 0) or 0),
+            "gen": int(req.get("completion_tokens_total", 0) or 0),
+            "completed": int(req.get("completed", 0) or 0),
+            "active": int(req.get("active", 0) or 0),
+        }
+
+        if new_instance:
+            # Neuer Serverprozess = neues Modell: Werte der alten Instanz verwerfen.
+            # Zaehler NICHT nachtragen -- die Summen seit Serverstart wurden
+            # (falls das Dashboard schon lief) bereits gezaehlt.
+            self._ft_prev = snap
+            self._reset_llamacpp_log_state()
+            for k in ("draft_acceptance", "draft_accepted", "draft_generated",
+                      "draft_generated_total", "draft_accepted_total",
+                      "draft_acceptance_total"):
+                self._latest[k] = 0
+            self._latest["prompt_progress"] = 0
+            self._latest["phase"] = "idle"
+            self._latest["is_active"] = False
+            self._latest["model"] = model.get("id", "") or ""
+            self._latest["last_update"] = now
+            return True
+
+        d_prompt = max(0, snap["prompt"] - prev["prompt"])
+        d_gen = max(0, snap["gen"] - prev["gen"])
+
+        is_active = snap["active"] > 0
+        new_request = is_active and (
+            not prev["active"] or snap["completed"] > prev["completed"]
+        )
+        if new_request:
+            self._latest["phase"] = "prompt"
+            self._latest["prompt_progress"] = 0.0
+            self._latest["prompt_tokens"] = 0
+
+        if d_prompt > 0:
+            # prefill_tps ist ein Mittel ueber ein rollierendes Fenster --
+            # dieselbe Groesse, die Freetoken im Log als "input throughput" meldet.
+            self._latest["prompt_tokens_per_sec"] = float(thr.get("prefill_tps", 0) or 0)
+            self._latest["p_s_time"] = now
+            self._latest["prompt_tokens"] = int(self._latest.get("prompt_tokens", 0) or 0) + d_prompt
+            self._latest["has_timing"] = True
+            self._latest["total_input_tokens"] += d_prompt
+            self._latest["session_input_tokens"] += d_prompt
+        if d_gen > 0:
+            self._latest["tokens_per_sec"] = float(thr.get("decode_tps", 0) or 0)
+            self._latest["tok_s_time"] = now
+            self._latest["eval_tokens"] = d_gen
+            self._latest["has_timing"] = True
+            self._latest["total_output_tokens"] += d_gen
+            self._latest["session_output_tokens"] += d_gen
+
+        if is_active:
+            if d_gen > 0:
+                self._latest["phase"] = "generation"
+            if self._latest.get("phase") == "generation":
+                self._latest["prompt_progress"] = 100.0
+            self._latest["queue_length"] = snap["active"]
+            self._latest["last_queue_update"] = now
+        else:
+            self._latest["phase"] = "idle"
+            self._latest["prompt_progress"] = 0
+            self._latest["queue_length"] = 0
+        self._latest["is_active"] = is_active
+
+        kv = st.get("kv", {}) or {}
+        if self._ft_page_size and kv.get("used_pages") is not None:
+            self._latest["n_tokens_max"] = int(kv["used_pages"]) * self._ft_page_size
+        self._latest["model"] = model.get("id", "") or self._latest.get("model", "")
+
+        self._ft_prev = snap
+        self._latest["last_update"] = now
+        return True
 
     async def _fetch_llamacpp_model(self, port: int):
         """Model alias/name from the llama-server /props + /v1/models."""
@@ -2189,7 +2334,8 @@ async def _collect_stats():
 
     return {
         "timestamp": datetime.now().isoformat(),
-        "mode": {"unsloth": "Unsloth Studio", "ollama": "Ollama", "llamacpp": "llama.cpp"}.get(str(DASHBOARD_MODE), "LM Studio"),
+        "mode": ("Freetoken" if str(DASHBOARD_MODE) == "llamacpp" and log_parser._backend_kind == "freetoken"
+                 else {"unsloth": "Unsloth Studio", "ollama": "Ollama", "llamacpp": "llama.cpp"}.get(str(DASHBOARD_MODE), "LM Studio")),
         "gpus": gpus,
         "cpu": cpu,
         "memory": mem,

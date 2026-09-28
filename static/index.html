@@ -647,6 +647,7 @@ function update(d){
   let newMode;
   if(serverMode.includes('Unsloth')) newMode='unsloth';
   else if(serverMode.includes('Ollama')) newMode='ollama';
+  else if(serverMode.includes('llama.cpp')||serverMode.includes('Freetoken')) newMode='llamacpp';
   else newMode='lmstudio';
   if(newMode !== currentMode){
     currentMode = newMode;
@@ -865,7 +866,8 @@ function update(d){
   // Hide MTP Draft row where no draft stats are available
   // (llama.cpp /metrics and LM Studio logs provide spec_decode counters)
   const draftRow = document.querySelector('.lm-draft');
-  if (draftRow && d.mode === 'Unsloth Studio') {
+  // Freetoken: keine spekulative Dekodierung (MTP) -> Zeile ausblenden
+  if (draftRow && (d.mode === 'Unsloth Studio' || d.mode === 'Freetoken')) {
     draftRow.style.display = 'none';
   } else if (draftRow) {
     draftRow.style.display = '';
