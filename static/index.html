@@ -647,7 +647,7 @@ function update(d){
   let newMode;
   if(serverMode.includes('Unsloth')) newMode='unsloth';
   else if(serverMode.includes('Ollama')) newMode='ollama';
-  else if(serverMode.includes('llama.cpp')||serverMode.includes('Freetoken')) newMode='llamacpp';
+  else if(serverMode.includes('llama.cpp')||serverMode.includes('Freetoken')||serverMode.includes('Strata')) newMode='llamacpp';
   else newMode='lmstudio';
   if(newMode !== currentMode){
     currentMode = newMode;
@@ -859,7 +859,9 @@ function update(d){
     const ml=ls.draft_mean_len;
     const tip=(ml!=null&&ml>0)
       ? `Letzte Anfrage: ${ls.draft_accepted} von ${draftGen} Draft-Tokens akzeptiert, mittlere Laenge ${ml.toFixed(2)}`
-      : 'Noch keine abgeschlossene Anfrage mit MTP';
+      : (draftGen>0)
+        ? `Letzte Anfrage: ${ls.draft_accepted} von ${draftGen} Draft-Tokens akzeptiert`
+        : 'Noch keine abgeschlossene Anfrage mit MTP';
     ['lda','ldr','ldr2'].forEach(id=>{const e=document.getElementById(id); if(e&&e.parentElement) e.parentElement.title=tip;});
   }
 

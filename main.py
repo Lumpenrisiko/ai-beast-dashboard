@@ -275,7 +275,8 @@ class LlmLogParser:
         self._llamacpp_req_prompt_base = None
         # Freetoken (anderer Server auf demselben Port, ohne /metrics und /slots).
         # Erkannt am 404 von /metrics; dann liefert /v1/stats die Werte.
-        self._backend_kind = "llamacpp"      # "llamacpp" | "freetoken"
+        self._backend_kind = "llamacpp"      # "llamacpp" | "freetoken" | "strata"
+        self._strata_prev = None             # letzter Strata-/metrics-Snapshot (totals)
         self._backend_recheck = 0.0
         self._ft_prev = None                  # letzter /v1/stats-Snapshot
         self._ft_page_size = 0                # echte KV-Page-Size aus /v1/cache/status
@@ -891,6 +892,10 @@ class LlmLogParser:
         if self._backend_kind == "freetoken" and time.time() < self._backend_recheck:
             await self._poll_freetoken(port)
             return
+        # Strata hat /metrics, aber als JSON -- direkt dorthin, /slots wird nicht gebraucht
+        if self._backend_kind == "strata" and time.time() < self._backend_recheck:
+            if await self._poll_strata(port):
+                return
         try:
             async with aiohttp.ClientSession() as session:
                 try:
@@ -914,6 +919,13 @@ class LlmLogParser:
                 # Kein llama-server -- vielleicht Freetoken auf demselben Port
                 await self._poll_freetoken(port)
                 return
+            if text.lstrip().startswith("{"):
+                # /metrics als JSON = Strata (llama.cpp liefert Prometheus-Text)
+                try:
+                    if await self._poll_strata(port, json.loads(text)):
+                        return
+                except ValueError:
+                    pass
             if self._backend_kind != "llamacpp":
                 # Wechsel Freetoken -> llama-server: Zustand neu aufsetzen
                 self._backend_kind = "llamacpp"
@@ -1200,6 +1212,133 @@ class LlmLogParser:
             self._latest["last_update"] = now
         except Exception:
             pass
+
+    async def _poll_strata(self, port: int, st: dict | None = None) -> bool:
+        """Strata-Server (github.com/Niko1221/Strata) ueber /metrics abfragen.
+
+        Strata liefert unter /metrics JSON statt des Prometheus-Formats von llama.cpp:
+          live:     state idle|reading|generating, queued, prompt_tokens,
+                    prompt_read/prompt_total (echter Prompt-Fortschritt in 8192er
+                    Bloecken), prefill_tok_s_mean, tok_s (2-s-Fenster), generated
+          requests: abgeschlossene Anfragen, je drafts_offered/drafts_accepted (MTP)
+          totals:   Summen seit Serverstart ("since" wechselt bei jedem Neustart)
+        Liefert False, wenn unter dem Port kein Strata antwortet.
+        """
+        if st is None:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"http://127.0.0.1:{port}/metrics",
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        if resp.status != 200:
+                            return False
+                        st = json.loads(await resp.text())
+            except Exception:
+                return False
+        if not isinstance(st, dict) or "live" not in st or "totals" not in st:
+            return False
+
+        now = time.time()
+        live = st.get("live") or {}
+        totals = st.get("totals") or {}
+        reqs = st.get("requests") or []
+        eng = st.get("engine") or {}
+        # neueste abgeschlossene Anfrage -- Strata listet sie neueste zuerst, nach Zeit
+        # suchen statt sich auf die Reihenfolge zu verlassen
+        last = max(reqs, key=lambda r: r.get("time") or 0) if reqs else None
+        snap = {
+            "since": totals.get("since"),
+            "prompt": int(totals.get("prompt_tokens") or 0),   # alle Eingabe-Tokens inkl. wiederverwendeter
+            "reused": int(totals.get("reused") or 0),          # davon aus dem Cache
+            "out": int(totals.get("output_tokens") or 0),
+            "req_time": last.get("time") if last else None,
+        }
+        prev = self._strata_prev
+        new_instance = self._backend_kind != "strata" or prev is None or prev.get("since") != snap["since"]
+        self._backend_kind = "strata"
+        self._backend_recheck = now + 30
+        self._latest["model"] = eng.get("model") or self._latest.get("model", "")
+
+        # MTP-Summen seit Serverstart
+        off_t = int(totals.get("drafts_offered") or 0)
+        acc_t = int(totals.get("drafts_accepted") or 0)
+        self._latest["draft_generated_total"] = off_t
+        self._latest["draft_accepted_total"] = acc_t
+        self._latest["draft_acceptance_total"] = (acc_t / off_t) if off_t > 0 else 0.0
+
+        if new_instance:
+            # Neuer Serverprozess = ggf. neues Modell: Werte der alten Instanz verwerfen,
+            # Zaehler NICHT nachtragen (wurden schon gezaehlt, falls das Dashboard lief)
+            self._strata_prev = snap
+            self._reset_llamacpp_log_state()
+            for k in ("draft_acceptance", "draft_accepted", "draft_generated"):
+                self._latest[k] = 0
+            self._latest["draft_mean_len"] = 0
+            self._latest["prompt_progress"] = 0
+            self._latest["phase"] = "idle"
+            self._latest["is_active"] = False
+            self._latest["last_update"] = now
+            return True
+
+        # Token-Zaehler (OpenRouter-Stil: Eingabe inkl. Cache-Treffer)
+        d_prompt = max(0, snap["prompt"] - prev["prompt"])
+        d_reused = max(0, snap["reused"] - prev["reused"])
+        d_out = max(0, snap["out"] - prev["out"])
+        if d_prompt or d_out:
+            self._latest["total_input_tokens"] += d_prompt
+            self._latest["total_input_cached_tokens"] += d_reused
+            self._latest["session_input_tokens"] += d_prompt
+            self._latest["session_input_cached_tokens"] += d_reused
+            self._latest["total_output_tokens"] += d_out
+            self._latest["session_output_tokens"] += d_out
+            self._latest["has_timing"] = True
+
+        # MTP der zuletzt abgeschlossenen Anfrage (bleibt stehen bis zur naechsten)
+        if last and snap["req_time"] != prev.get("req_time"):
+            off = int(last.get("drafts_offered") or 0)
+            acc = int(last.get("drafts_accepted") or 0)
+            self._latest["draft_generated"] = off
+            self._latest["draft_accepted"] = acc
+            self._latest["draft_acceptance"] = (acc / off) if off > 0 else 0.0
+            self._latest["draft_mean_len"] = 0     # liefert Strata nicht
+            self._latest["draft_time"] = now
+            if last.get("decode_tok_s"):
+                self._latest["eval_tokens"] = int(last.get("output_tokens") or 0)
+
+        state = live.get("state") or "idle"
+        queued = int(live.get("queued") or 0)
+        active = state in ("reading", "generating")
+        if state == "reading":
+            self._latest["phase"] = "prompt"
+            total = live.get("prompt_total") or live.get("prompt_tokens") or 0
+            read = live.get("prompt_read") or 0
+            self._latest["prompt_progress"] = (min(100.0, read / total * 100.0) if total else 0.0)
+            if live.get("prefill_tok_s_mean"):
+                self._latest["prompt_tokens_per_sec"] = float(live["prefill_tok_s_mean"])
+                self._latest["p_s_time"] = now
+            if live.get("prompt_tokens"):
+                self._latest["prompt_tokens"] = int(live["prompt_tokens"])
+            self._latest["has_timing"] = True
+        elif state == "generating":
+            self._latest["phase"] = "generation"
+            self._latest["prompt_progress"] = 100.0
+            if live.get("tok_s"):
+                self._latest["tokens_per_sec"] = float(live["tok_s"])
+                self._latest["tok_s_time"] = now
+                self._latest["has_timing"] = True
+        else:
+            self._latest["phase"] = "idle"
+            self._latest["prompt_progress"] = 0
+        if active:
+            self._latest["n_tokens_max"] = int(live.get("prompt_tokens") or 0) + int(live.get("generated") or 0)
+        self._latest["is_active"] = active
+        self._latest["queue_length"] = queued + (1 if active else 0)
+        self._latest["last_queue_update"] = now
+
+        self._strata_prev = snap
+        self._latest["last_update"] = now
+        return True
 
     async def _poll_freetoken(self, port: int) -> bool:
         """Freetoken-Server ueber /v1/stats abfragen.
@@ -2033,9 +2172,11 @@ async def get_loaded_models() -> list:
                             models.append(m.get("name", m.get("model", "")))
                     elif DASHBOARD_MODE in ("unsloth", "llamacpp"):
                         # llama-server /v1/models: geladene Modelle (OpenAI-Format)
-                        for m in (data.get("data") or data.get("models") or []):
+                        entries = data.get("data") or data.get("models") or []
+                        alias_ids = {a for m in entries for a in (m.get("aliases") or []) if isinstance(a, str)}
+                        for m in entries:
                             mid = m.get("id") or m.get("name", "")
-                            if mid:
+                            if mid and mid not in alias_ids:
                                 models.append(mid)
                     # LM Studio: kein "loaded"-Endpoint (via Log-Parser)
     except Exception:
@@ -2335,6 +2476,7 @@ async def _collect_stats():
     return {
         "timestamp": datetime.now().isoformat(),
         "mode": ("Freetoken" if str(DASHBOARD_MODE) == "llamacpp" and log_parser._backend_kind == "freetoken"
+                 else "Strata" if str(DASHBOARD_MODE) == "llamacpp" and log_parser._backend_kind == "strata"
                  else {"unsloth": "Unsloth Studio", "ollama": "Ollama", "llamacpp": "llama.cpp"}.get(str(DASHBOARD_MODE), "LM Studio")),
         "gpus": gpus,
         "cpu": cpu,
