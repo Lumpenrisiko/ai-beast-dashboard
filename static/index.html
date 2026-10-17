@@ -114,14 +114,18 @@ body{
 }
 .gpu-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .gpu-nm{font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.gpu-bd{flex:1;padding:5px 12px 7px;display:flex;flex-direction:column;gap:2px}
+.gpu-bd{flex:1;padding:8px 12px 10px;display:flex;flex-direction:column;gap:7px}
 .gm{
-  display:grid;grid-template-columns:52px 1fr 68px;align-items:center;gap:5px;
+  display:grid;grid-template-columns:minmax(58px,auto) 1fr minmax(62px,auto);align-items:center;gap:6px;
 }
-.gm-l{font-size:.72rem;color:var(--m)}
+.gm-l{font-size:.72rem;color:var(--m);white-space:nowrap}
+/* compact temperature strip: Hot · VRAM max · F/B · sensor in one line */
+.gt{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;font-size:.72rem;padding:1px 0}
+.gt .k{color:var(--m);margin-right:4px}
+.gt b{font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
 .gm-b{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
 .gm-f{height:100%;border-radius:2px;transition:width .5s ease}
-.gm-v{font-size:.78rem;font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+.gm-v{font-size:.78rem;font-weight:600;font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
 
 /* ─── Chart ───────────────────────────────────── */
 .ch{
@@ -468,6 +472,8 @@ body{
 const COL=['#3b82f6','#22c55e','#a855f7'];
 const tc=t=>t<60?'var(--green)':t<80?'var(--yellow)':'var(--red)';
 const vtc=t=>t<65?'var(--green)':t<80?'var(--yellow)':'var(--red)';
+// GDDR6X junction: fine up to ~85 °C, watch above 100 °C, throttles at ~110 °C
+const vmc=t=>t==null?'var(--m)':t<86?'var(--green)':t<100?'var(--yellow)':'var(--red)';
 const fmtNum=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n);
 
 // Wait for DOM to be ready before attaching event listeners
@@ -569,9 +575,13 @@ function buildGPUs(n){
       <div class="gpu-bd">
         <div class="gm"><span class="gm-l">⚡ Util</span><div class="gm-b"><div class="gm-f" id="g${i}u" style="width:0%;background:${COL[i%3]}"></div></div><span class="gm-v" id="g${i}ut">--%</span></div>
         <div class="gm"><span class="gm-l">🌡 Temp</span><div class="gm-b"><div class="gm-f" id="g${i}t" style="width:0%;background:var(--green)"></div></div><span class="gm-v" id="g${i}tt">--°C</span></div>
-        <div class="gm"><span class="gm-l">🌡 Hot</span><span class="gm-v" id="g${i}ht" style="grid-column:2/4">--°C</span></div>
+        <div class="gt">
+          <span title="GPU-Hotspot"><span class="k">Hot</span><b id="g${i}ht">--°C</b></span>
+          <span title="Heissester GDDR6X-Chip (Speicher drosselt ab ~110 °C)"><span class="k">🔥 VRAM</span><b id="g${i}mx">--°C</b></span>
+          <span title="Mittlere Chip-Temperatur Vorder-/Rueckseite der Platine"><span class="k">F/B</span><b id="g${i}fb">--°C</b></span>
+          <span title="Sammelsensor VRAM (kann 10–20 K unter dem heissesten Chip liegen)"><span class="k">sens</span><b id="g${i}mt">--°C</b></span>
+        </div>
         <div class="gm"><span class="gm-l">🧠 VRAM</span><div class="gm-b"><div class="gm-f" id="g${i}v" style="width:0%;background:var(--purple)"></div></div><span class="gm-v" id="g${i}vt">--</span></div>
-        <div class="gm"><span class="gm-l">🌡 VRAM</span><span class="gm-v" id="g${i}mt" style="grid-column:2/4">--°C</span></div>
         <div class="gm"><span class="gm-l">🔌 Pwr</span><div class="gm-b"><div class="gm-f" id="g${i}p" style="width:0%;background:var(--orange)"></div></div><span class="gm-v" id="g${i}pt">--</span></div>
         <div class="gm"><span class="gm-l">🎯 Clk</span><span class="gm-v" id="g${i}c" style="grid-column:2/4">-- MHz</span></div>
       </div>
@@ -667,8 +677,23 @@ function update(d){
     document.getElementById(`g${id}ht`).style.color=tc(g.hotspot_temp);
     document.getElementById(`g${id}v`).style.width=`${(g.mem_used/g.mem_total)*100}%`;
     document.getElementById(`g${id}vt`).textContent=`${(g.mem_used/1024).toFixed(1)}/${(g.mem_total/1024).toFixed(0)} GiB`;
-    document.getElementById(`g${id}mt`).textContent=g.mem_temperature!=null?`${g.mem_temperature}°C`:'N/A';
+    document.getElementById(`g${id}mt`).textContent=g.mem_temperature!=null?`${g.mem_temperature}°C`:'';
+    // Chip-Temperaturen liefert LACT nur fuer manche Karten (GDDR6X). Fehlen sie,
+    // Feld ausblenden statt "N/A" -- sonst zeigt z. B. die 5090 drei leere Felder.
+    const showT=(el,on)=>{el.parentElement.style.display=on?'':'none';};
     document.getElementById(`g${id}mt`).style.color=vtc(g.mem_temperature);
+    showT(document.getElementById(`g${id}mt`),g.mem_temperature!=null);
+    const mx=document.getElementById(`g${id}mx`);
+    mx.textContent=g.vram_max_temp!=null?`${g.vram_max_temp}°C${g.vram_max_chip?' '+g.vram_max_chip:''}`:'';
+    mx.style.color=vmc(g.vram_max_temp);
+    showT(mx,g.vram_max_temp!=null);
+    // Vorder- oder Rueckseite kann fehlen (einseitig bestueckte Platinen)
+    const fb=document.getElementById(`g${id}fb`);
+    const fAvg=g.vram_front_avg, bAvg=g.vram_back_avg;
+    const fbTxt=v=>v!=null?v.toFixed(0):'–';
+    fb.textContent=(fAvg!=null||bAvg!=null)?`${fbTxt(fAvg)}/${fbTxt(bAvg)}°C`:'';
+    fb.style.color=vmc(fAvg==null&&bAvg==null?null:Math.max(fAvg??0,bAvg??0));
+    showT(fb,fAvg!=null||bAvg!=null);
     document.getElementById(`g${id}p`).style.width=`${(g.power_draw/g.power_limit)*100}%`;
     document.getElementById(`g${id}pt`).textContent=`${g.power_draw.toFixed(1)}W`;
     document.getElementById(`g${id}c`).textContent=`${g.clock_graphics} MHz`;

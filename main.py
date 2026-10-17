@@ -1803,6 +1803,10 @@ async def get_gpu_stats() -> list:
                     "clock_max_graphics": float(parts[12]),
                     "clock_max_memory": float(parts[13]),
                     "hotspot_temp": None,
+                    "vram_max_temp": None,
+                    "vram_max_chip": None,
+                    "vram_front_avg": None,
+                    "vram_back_avg": None,
                 })
 
         # Get LACT stats for hotspot/VRAM temps
@@ -1813,10 +1817,18 @@ async def get_gpu_stats() -> list:
                 gpu["hotspot_temp"] = lact_stats[idx].get("hotspot")
                 if gpu["mem_temperature"] is None:
                     gpu["mem_temperature"] = lact_stats[idx].get("vram")
+                # Per-chip VRAM temps: the aggregate "VRAM" sensor can read 10-20 K below
+                # the hottest chip, so expose the max (what GDDR6X throttles on) separately.
+                for key in ("vram_max_temp", "vram_max_chip", "vram_front_avg", "vram_back_avg"):
+                    gpu[key] = lact_stats[idx].get(key)
 
         return gpus
     except Exception as e:
         return [{"error": str(e)}]
+
+
+_LACT_IDS_TTL = 60.0
+_lact_ids_cache: dict = {"ids": [], "time": 0.0}
 
 
 async def _get_lact_stats() -> dict:
@@ -1847,7 +1859,33 @@ async def _get_lact_stats() -> dict:
                 if len(parts) >= 2:
                     nvidia_pci[parts[1].strip()] = int(parts[0])
 
-        for lact_id in range(1, gpu_count + 1):
+        # LACT numbers *all* GPUs (incl. iGPUs), so its ids don't line up with nvidia-smi.
+        # Ask LACT for its id list; the PCI-bus match below maps each one to nvidia-smi.
+        # Die Liste aendert sich nur beim Ein-/Ausbau einer Karte, wird also
+        # zwischengespeichert statt jede Sekunde einen weiteren Prozess zu starten.
+        # Nur NVIDIA-Karten (Vendor 10DE) -- die iGPU braucht keine stats-Abfrage.
+        now = time.time()
+        lact_ids = _lact_ids_cache["ids"]
+        if not lact_ids or now - _lact_ids_cache["time"] > _LACT_IDS_TTL:
+            lact_ids = []
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "lact", "cli", "list",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                lact_ids = [
+                    int(m.group(1))
+                    for m in re.finditer(r"^(\d+):\s*10DE:", stdout.decode(), re.M | re.I)
+                ]
+            except (asyncio.TimeoutError, Exception):
+                pass
+            if lact_ids:
+                _lact_ids_cache.update(ids=lact_ids, time=now)
+        if not lact_ids:
+            lact_ids = list(range(0, gpu_count + 1))
+
+        for lact_id in lact_ids:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "lact", "cli", "-g", str(lact_id), "stats",
@@ -1872,6 +1910,7 @@ async def _get_lact_stats() -> dict:
                     continue
 
                 hotspot = vram = None
+                chips = []
                 for line in text.split("\n"):
                     if "Temperatures:" in line:
                         if "GPU Hotspot:" in line:
@@ -1882,7 +1921,23 @@ async def _get_lact_stats() -> dict:
                             m = re.search(r"VRAM:\s*(\d+)°C", line)
                             if m:
                                 vram = int(m.group(1))
+                        chips = [
+                            (f"{name} {side.lower()}", int(temp), side)
+                            for name, side, temp in re.findall(
+                                r"VRAM Chip (\S+) \((Front|Back)\):\s*(\d+)°C", line
+                            )
+                        ]
                 result[nvidia_idx] = {"hotspot": hotspot, "vram": vram}
+                if chips:
+                    hottest = max(chips, key=lambda c: c[1])
+                    front = [t for _, t, s in chips if s == "Front"]
+                    back = [t for _, t, s in chips if s == "Back"]
+                    result[nvidia_idx].update({
+                        "vram_max_temp": hottest[1],
+                        "vram_max_chip": hottest[0],
+                        "vram_front_avg": round(sum(front) / len(front), 1) if front else None,
+                        "vram_back_avg": round(sum(back) / len(back), 1) if back else None,
+                    })
             except (asyncio.TimeoutError, Exception):
                 continue
     except Exception:
