@@ -1921,10 +1921,14 @@ async def _get_lact_stats() -> dict:
                             m = re.search(r"VRAM:\s*(\d+)°C", line)
                             if m:
                                 vram = int(m.group(1))
+                        # LACT >= 0.10 haengt "(Front)"/"(Back)" nur bei Clamshell-
+                        # Platinen an (Chips beidseitig, z. B. 3090). Einseitige Karten
+                        # wie die 5090 melden nur "VRAM Chip A0: 52°C" -- dann gibt es
+                        # den heissesten Chip, aber keine Vorder-/Rueckseiten-Mittel.
                         chips = [
-                            (f"{name} {side.lower()}", int(temp), side)
+                            (f"{name} {side.lower()}" if side else name, int(temp), side)
                             for name, side, temp in re.findall(
-                                r"VRAM Chip (\S+) \((Front|Back)\):\s*(\d+)°C", line
+                                r"VRAM Chip (\S+?)(?: \((Front|Back)\))?:\s*(\d+)°C", line
                             )
                         ]
                 result[nvidia_idx] = {"hotspot": hotspot, "vram": vram}
